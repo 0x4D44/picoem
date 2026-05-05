@@ -630,4 +630,526 @@ mod tests {
         assert_eq!(bus.read32(I2C0_BASE + IC_SS_SCL_HCNT, 0), 0x30);
         assert_eq!(bus.read32(I2C1_BASE + IC_SS_SCL_HCNT, 0), 0x40);
     }
+
+    // -----------------------------------------------------------------
+    // Branch coverage uplift: drive the IC_DATA_CMD decode, IC_RAW_INTR_STAT
+    // mask updates, FIFO-level reads, and IC_ENABLE side-effects.
+    // -----------------------------------------------------------------
+
+    /// Helper: enable I2C0 on a fresh instance; returns it ready for an
+    /// IC_DATA_CMD write.
+    fn enabled_i0() -> (I2cRegs, u64) {
+        let mut i = i0();
+        let mut irqs = 0u64;
+        i.write32(IC_TAR, 0x55, 0, &mut irqs);
+        i.write32(IC_ENABLE, 1, 0, &mut irqs);
+        // Clear START_DET / TX_ABRT / STOP_DET sticky bits between
+        // helper-issued writes so each test starts from a known state.
+        let _ = i.read32(IC_CLR_INTR);
+        (i, irqs)
+    }
+
+    /// IC_DATA_CMD: write-with-no-flags pushes the byte into TX FIFO,
+    /// then the NACK path clears it (no slave registered) and asserts
+    /// TX_ABRT. Covers the `is_read=false` write branch (lines ~272-276)
+    /// and the `!ack` cleanup at line 264.
+    #[test]
+    fn ic_data_cmd_write_byte_no_flags_nacks_and_clears_fifo() {
+        let (mut i, mut irqs) = enabled_i0();
+        i.write32(IC_DATA_CMD, 0xAB, 0, &mut irqs);
+        // NACK clears tx_fifo per simulate_transaction line 264.
+        assert_eq!(i.tx_fifo.len(), 0);
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+        // No STOP bit was set, but `!ack` also asserts STOP_DET (line 279).
+        assert_ne!(i.raw_intr_stat & INT_STOP_DET, 0);
+        // 7-bit address path: ABRT_7B_ADDR_NOACK *was* set during the
+        // transaction but auto-cleared once STOP completed.
+        assert_eq!(i.tx_abrt_source, 0);
+    }
+
+    /// IC_DATA_CMD: write-with-RESTART (no STOP, no CMD/READ). Same NACK
+    /// path; verifies the RESTART bit is benign. Covers the high-bit
+    /// path at line ~210 (DATA_CMD_RESTART set).
+    #[test]
+    fn ic_data_cmd_write_with_restart_only() {
+        let (mut i, mut irqs) = enabled_i0();
+        i.write32(IC_DATA_CMD, DATA_CMD_RESTART | 0x44, 0, &mut irqs);
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+        assert_ne!(i.raw_intr_stat & INT_STOP_DET, 0);
+    }
+
+    /// IC_DATA_CMD: write + STOP, no RESTART, no READ. Covers the
+    /// explicit `cmd & DATA_CMD_STOP != 0` half of line 279.
+    #[test]
+    fn ic_data_cmd_write_with_stop_only() {
+        let (mut i, mut irqs) = enabled_i0();
+        i.write32(IC_DATA_CMD, DATA_CMD_STOP | 0x77, 0, &mut irqs);
+        assert_ne!(i.raw_intr_stat & INT_STOP_DET, 0);
+    }
+
+    /// IC_DATA_CMD: write + STOP + RESTART (CMD=0). All three flag
+    /// combinations exercised together.
+    #[test]
+    fn ic_data_cmd_write_stop_restart() {
+        let (mut i, mut irqs) = enabled_i0();
+        i.write32(
+            IC_DATA_CMD,
+            DATA_CMD_STOP | DATA_CMD_RESTART | 0x88,
+            0,
+            &mut irqs,
+        );
+        assert_ne!(i.raw_intr_stat & INT_STOP_DET, 0);
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+    }
+
+    /// IC_DATA_CMD: read (CMD=1), no STOP, no RESTART. NACK path
+    /// (no slave) so the read branch (lines 265-271) is *not* taken --
+    /// abort wins. The is_read decode itself is exercised though.
+    #[test]
+    fn ic_data_cmd_read_no_stop_no_restart() {
+        let (mut i, mut irqs) = enabled_i0();
+        i.write32(IC_DATA_CMD, DATA_CMD_READ, 0, &mut irqs);
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+    }
+
+    /// IC_DATA_CMD: read + RESTART (no STOP). Same NACK fate.
+    #[test]
+    fn ic_data_cmd_read_with_restart() {
+        let (mut i, mut irqs) = enabled_i0();
+        i.write32(IC_DATA_CMD, DATA_CMD_READ | DATA_CMD_RESTART, 0, &mut irqs);
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+    }
+
+    /// IC_DATA_CMD: read + STOP. Covers DATA_CMD_READ + DATA_CMD_STOP
+    /// combination.
+    #[test]
+    fn ic_data_cmd_read_with_stop() {
+        let (mut i, mut irqs) = enabled_i0();
+        i.write32(IC_DATA_CMD, DATA_CMD_READ | DATA_CMD_STOP, 0, &mut irqs);
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+        assert_ne!(i.raw_intr_stat & INT_STOP_DET, 0);
+    }
+
+    /// IC_DATA_CMD: read + STOP + RESTART. All three high bits set.
+    #[test]
+    fn ic_data_cmd_read_stop_restart_all_set() {
+        let (mut i, mut irqs) = enabled_i0();
+        i.write32(
+            IC_DATA_CMD,
+            DATA_CMD_READ | DATA_CMD_STOP | DATA_CMD_RESTART,
+            0,
+            &mut irqs,
+        );
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+        assert_ne!(i.raw_intr_stat & INT_STOP_DET, 0);
+    }
+
+    /// IC_DATA_CMD writes are no-ops while disabled (line 247 early
+    /// return). Verifies no FIFO push, no RAW_INTR_STAT change.
+    #[test]
+    fn ic_data_cmd_while_disabled_is_noop() {
+        let mut i = i0();
+        let mut irqs = 0u64;
+        // Don't enable.
+        i.write32(IC_DATA_CMD, DATA_CMD_STOP | 0x99, 0, &mut irqs);
+        assert_eq!(i.raw_intr_stat, 0);
+        assert_eq!(i.tx_fifo.len(), 0);
+        assert!(!i.activity);
+    }
+
+    /// IC_INTR_STAT applies the IC_INTR_MASK gate. With raw bits set
+    /// but mask=0, the read returns zero. Covers line 307-308 (the
+    /// IC_INTR_STAT vs IC_INTR_MASK arms in read32).
+    #[test]
+    fn ic_intr_stat_masked_by_intr_mask() {
+        let mut i = i0();
+        let mut irqs = 0u64;
+        i.raw_intr_stat = INT_TX_ABRT | INT_STOP_DET;
+        // Default mask is 0x08FF; set it to exactly TX_ABRT.
+        i.write32(IC_INTR_MASK, INT_TX_ABRT, 0, &mut irqs);
+        assert_eq!(i.read32(IC_INTR_MASK), INT_TX_ABRT);
+        let stat = i.read32(IC_INTR_STAT);
+        assert_eq!(stat & INT_TX_ABRT, INT_TX_ABRT);
+        assert_eq!(stat & INT_STOP_DET, 0, "STOP_DET masked off");
+        // Raw remains intact.
+        assert_eq!(i.read32(IC_RAW_INTR_STAT), INT_TX_ABRT | INT_STOP_DET);
+    }
+
+    /// IC_INTR_MASK write triggers an IRQ re-route (line 430).
+    /// Setting an unmasked bit while raw is asserted should set the
+    /// NVIC pending flag immediately.
+    #[test]
+    fn ic_intr_mask_write_routes_irq_when_raw_already_set() {
+        let mut i = i0();
+        let mut irqs = 0u64;
+        i.raw_intr_stat = INT_TX_ABRT;
+        // Initially mask off TX_ABRT.
+        i.write32(IC_INTR_MASK, 0, 0, &mut irqs);
+        assert_eq!(irqs & (1u64 << I2C0_IRQ), 0);
+        // Now unmask -- the write should route the IRQ.
+        i.write32(IC_INTR_MASK, INT_TX_ABRT, 0, &mut irqs);
+        assert_ne!(irqs & (1u64 << I2C0_IRQ), 0);
+    }
+
+    /// IC_RAW_INTR_STAT.STOP_DET cleared by reading IC_CLR_STOP_DET
+    /// (line 358-360).
+    #[test]
+    fn ic_clr_stop_det_clears_only_stop_det() {
+        let mut i = i0();
+        i.raw_intr_stat = INT_STOP_DET | INT_START_DET | INT_TX_ABRT;
+        let _ = i.read32(IC_CLR_STOP_DET);
+        assert_eq!(i.raw_intr_stat & INT_STOP_DET, 0);
+        // Other bits untouched.
+        assert_ne!(i.raw_intr_stat & INT_START_DET, 0);
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+    }
+
+    /// IC_CLR_START_DET clears just the START_DET bit (lines 362-364).
+    #[test]
+    fn ic_clr_start_det_clears_only_start_det() {
+        let mut i = i0();
+        i.raw_intr_stat = INT_STOP_DET | INT_START_DET;
+        let _ = i.read32(IC_CLR_START_DET);
+        assert_eq!(i.raw_intr_stat & INT_START_DET, 0);
+        assert_ne!(i.raw_intr_stat & INT_STOP_DET, 0);
+    }
+
+    /// IC_CLR_INTR clears the auto-clearable raw bits AND
+    /// IC_TX_ABRT_SOURCE (line 312-327). Verifies the bulk-clear path.
+    #[test]
+    fn ic_clr_intr_clears_all_auto_clear_bits_and_tx_abrt_source() {
+        let mut i = i0();
+        i.raw_intr_stat = INT_RX_UNDER
+            | INT_RX_OVER
+            | INT_TX_OVER
+            | INT_RD_REQ
+            | INT_TX_ABRT
+            | INT_RX_DONE
+            | INT_ACTIVITY
+            | INT_STOP_DET
+            | INT_START_DET
+            | INT_GEN_CALL
+            | INT_RESTART_DET
+            | INT_RX_FULL // *not* in auto-clear set
+            | INT_TX_EMPTY; // also not in auto-clear set
+        i.tx_abrt_source = ABRT_7B_ADDR_NOACK;
+        let _ = i.read32(IC_CLR_INTR);
+        // Auto-cleared bits gone.
+        let auto = INT_RX_UNDER
+            | INT_RX_OVER
+            | INT_TX_OVER
+            | INT_RD_REQ
+            | INT_TX_ABRT
+            | INT_RX_DONE
+            | INT_ACTIVITY
+            | INT_STOP_DET
+            | INT_START_DET
+            | INT_GEN_CALL
+            | INT_RESTART_DET;
+        assert_eq!(i.raw_intr_stat & auto, 0);
+        // Non-auto bits preserved.
+        assert_ne!(i.raw_intr_stat & INT_RX_FULL, 0);
+        assert_ne!(i.raw_intr_stat & INT_TX_EMPTY, 0);
+        // TX abort source register zeroed.
+        assert_eq!(i.tx_abrt_source, 0);
+    }
+
+    /// Each per-source clear register is independent. Walks them all.
+    #[test]
+    fn each_per_source_clear_reads_clears_only_its_bit() {
+        let mut i = i0();
+        for (offset, bit) in [
+            (IC_CLR_RX_UNDER, INT_RX_UNDER),
+            (IC_CLR_RX_OVER, INT_RX_OVER),
+            (IC_CLR_TX_OVER, INT_TX_OVER),
+            (IC_CLR_RD_REQ, INT_RD_REQ),
+            (IC_CLR_RX_DONE, INT_RX_DONE),
+            (IC_CLR_GEN_CALL, INT_GEN_CALL),
+        ] {
+            i.raw_intr_stat = bit | INT_TX_EMPTY; // INT_TX_EMPTY survives
+            let _ = i.read32(offset);
+            assert_eq!(
+                i.raw_intr_stat & bit,
+                0,
+                "clear {:#X} should drop bit {:#X}",
+                offset,
+                bit
+            );
+            assert_ne!(i.raw_intr_stat & INT_TX_EMPTY, 0);
+        }
+    }
+
+    /// IC_CLR_ACTIVITY clears the ACTIVITY raw bit and the
+    /// `activity` runtime flag (lines 353-356).
+    #[test]
+    fn ic_clr_activity_clears_runtime_flag() {
+        let mut i = i0();
+        i.raw_intr_stat = INT_ACTIVITY;
+        i.activity = true;
+        let _ = i.read32(IC_CLR_ACTIVITY);
+        assert_eq!(i.raw_intr_stat & INT_ACTIVITY, 0);
+        assert!(!i.activity);
+    }
+
+    /// IC_TXFLR / IC_RXFLR while empty (line 446 area: drained FIFOs).
+    /// Also covers the post-disable FIFO drop -- `IC_ENABLE 1->0`
+    /// clears both FIFOs and `activity` (lines 446-450).
+    #[test]
+    fn ic_enable_disable_clears_fifos_and_activity() {
+        let (mut i, mut irqs) = enabled_i0();
+        // Push a byte into rx_fifo manually and assert activity.
+        i.rx_fifo.push_back(0x12);
+        i.activity = true;
+        // Sanity: TXFLR=0, RXFLR=1 while enabled.
+        assert_eq!(i.read32(IC_TXFLR), 0);
+        assert_eq!(i.read32(IC_RXFLR), 1);
+        // Now disable.
+        i.write32(IC_ENABLE, 0, 0, &mut irqs);
+        assert_eq!(i.read32(IC_TXFLR), 0);
+        assert_eq!(i.read32(IC_RXFLR), 0);
+        assert!(!i.activity);
+        // IC_ENABLE_STATUS reflects disabled state.
+        assert_eq!(i.read32(IC_ENABLE_STATUS), 0);
+    }
+
+    /// IC_ENABLE 0->1 transition does *not* clear FIFOs (line 446 skip
+    /// branch), and IC_ENABLE_STATUS goes high.
+    #[test]
+    fn ic_enable_zero_to_one_preserves_state() {
+        let mut i = i0();
+        let mut irqs = 0u64;
+        // Pre-load rx_fifo while disabled (this isn't realistic but
+        // exercises the no-clear branch).
+        i.rx_fifo.push_back(0xCD);
+        i.write32(IC_ENABLE, 1, 0, &mut irqs);
+        assert_eq!(i.read32(IC_RXFLR), 1);
+        assert_eq!(i.read32(IC_ENABLE_STATUS), 1);
+    }
+
+    /// IC_STATUS while RX FIFO full sets RFF; while non-empty sets RFNE.
+    /// Covers lines 230-235.
+    #[test]
+    fn ic_status_rff_and_rfne_when_rx_full() {
+        let mut i = i0();
+        for _ in 0..I2C_FIFO_DEPTH {
+            i.rx_fifo.push_back(0);
+        }
+        let s = i.read32(IC_STATUS);
+        assert_ne!(s & STATUS_RFNE, 0);
+        assert_ne!(s & STATUS_RFF, 0);
+    }
+
+    /// IC_STATUS while TX FIFO is full clears TFNF and TFE (lines
+    /// 224-229). All three "full" branches exercised together.
+    #[test]
+    fn ic_status_tx_full_clears_tfnf_and_tfe() {
+        let mut i = i0();
+        for _ in 0..I2C_FIFO_DEPTH {
+            i.tx_fifo.push_back(0);
+        }
+        let s = i.read32(IC_STATUS);
+        assert_eq!(s & STATUS_TFNF, 0);
+        assert_eq!(s & STATUS_TFE, 0);
+    }
+
+    /// IC_STATUS while activity=true sets STATUS_ACTIVITY and
+    /// STATUS_MST_ACTIVITY (lines 220-222).
+    #[test]
+    fn ic_status_activity_flag() {
+        let mut i = i0();
+        i.activity = true;
+        let s = i.read32(IC_STATUS);
+        assert_ne!(s & STATUS_ACTIVITY, 0);
+        assert_ne!(s & STATUS_MST_ACTIVITY, 0);
+    }
+
+    /// `is_idle()` returns false in each of the three breaking
+    /// conditions: tx non-empty, rx non-empty, raw_intr_stat set.
+    /// Covers all three terms of the line-198 short-circuit chain.
+    #[test]
+    fn is_idle_false_for_each_term() {
+        // tx non-empty
+        let mut i = i0();
+        i.tx_fifo.push_back(0);
+        assert!(!i.is_idle());
+        // rx non-empty
+        let mut i = i0();
+        i.rx_fifo.push_back(0);
+        assert!(!i.is_idle());
+        // raw_intr_stat non-zero
+        let mut i = i0();
+        i.raw_intr_stat = INT_TX_ABRT;
+        assert!(!i.is_idle());
+    }
+
+    /// tx_dreq / rx_dreq honour the enable gate (lines 204, 210).
+    #[test]
+    fn dreq_predicates_require_enable() {
+        let mut i = i0();
+        // Disabled => false regardless of FIFO state.
+        assert!(!i.tx_dreq());
+        i.rx_fifo.push_back(0);
+        assert!(!i.rx_dreq());
+        // Enable -> tx_dreq true (FIFO has room), rx_dreq true (non-empty).
+        let mut irqs = 0u64;
+        i.write32(IC_ENABLE, 1, 0, &mut irqs);
+        assert!(i.tx_dreq());
+        assert!(i.rx_dreq());
+        // Fill TX FIFO to defeat the room check.
+        for _ in 0..I2C_FIFO_DEPTH {
+            i.tx_fifo.push_back(0);
+        }
+        assert!(!i.tx_dreq());
+    }
+
+    /// IC_DATA_CMD read drains the RX FIFO and clears the RX_FULL
+    /// raw bit when the level falls back to <= rx_tl (lines 296-301).
+    #[test]
+    fn read_ic_data_cmd_clears_rx_full_when_level_drops() {
+        let mut i = i0();
+        i.rx_fifo.push_back(0xDE);
+        i.rx_fifo.push_back(0xAD);
+        i.rx_tl = 0; // any non-empty level is "above" 0
+        i.raw_intr_stat = INT_RX_FULL;
+        // First pop: rx_fifo=[0xAD], len=1 > rx_tl=0, RX_FULL stays.
+        let b0 = i.read32(IC_DATA_CMD);
+        assert_eq!(b0, 0xDE);
+        assert_ne!(i.raw_intr_stat & INT_RX_FULL, 0);
+        // Second pop: rx_fifo=[], len=0 <= rx_tl=0 -> RX_FULL cleared.
+        let b1 = i.read32(IC_DATA_CMD);
+        assert_eq!(b1, 0xAD);
+        assert_eq!(i.raw_intr_stat & INT_RX_FULL, 0);
+    }
+
+    /// IC_DATA_CMD read on empty RX FIFO returns 0 (unwrap_or path,
+    /// line 297).
+    #[test]
+    fn read_ic_data_cmd_empty_returns_zero() {
+        let mut i = i0();
+        assert_eq!(i.read32(IC_DATA_CMD), 0);
+    }
+
+    /// 8-bit narrow write to IC_DATA_CMD takes the dedicated write8
+    /// path (line 471). Otherwise functionally equivalent.
+    #[test]
+    fn write8_to_ic_data_cmd_routes_through_simulate() {
+        let (mut i, mut irqs) = enabled_i0();
+        i.write8(IC_DATA_CMD, 0x42, &mut irqs);
+        // NACK path runs identically.
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+        assert_ne!(i.raw_intr_stat & INT_STOP_DET, 0);
+    }
+
+    /// 8-bit write to a non-IC_DATA_CMD register falls through to
+    /// write32 (line 473-474).
+    #[test]
+    fn write8_to_non_data_cmd_falls_through_to_write32() {
+        let mut i = i0();
+        let mut irqs = 0u64;
+        i.write8(IC_TX_TL, 0x07, &mut irqs);
+        assert_eq!(i.read32(IC_TX_TL), 0x07);
+    }
+
+    /// IC_INTR_MASK alias-2 (BITSET) and alias-3 (BITCLR) paths
+    /// exercise the `apply_alias_rmw` arm + truncation (line 429).
+    #[test]
+    fn ic_intr_mask_alias_set_and_clr() {
+        let mut i = i0();
+        let mut irqs = 0u64;
+        i.write32(IC_INTR_MASK, 0, 0, &mut irqs);
+        // BITSET alias=2.
+        i.write32(IC_INTR_MASK, INT_TX_ABRT, 2, &mut irqs);
+        assert_eq!(i.intr_mask & INT_TX_ABRT, INT_TX_ABRT);
+        // BITCLR alias=3.
+        i.write32(IC_INTR_MASK, INT_TX_ABRT, 3, &mut irqs);
+        assert_eq!(i.intr_mask & INT_TX_ABRT, 0);
+    }
+
+    /// IC_INTR_MASK truncates writes outside the 13-bit valid range.
+    #[test]
+    fn ic_intr_mask_truncates_to_13_bits() {
+        let mut i = i0();
+        let mut irqs = 0u64;
+        i.write32(IC_INTR_MASK, 0xFFFF_FFFF, 0, &mut irqs);
+        assert_eq!(i.intr_mask, INT_MASK_ALL);
+    }
+
+    /// route_irq early-return: with everything zero, no IRQ is
+    /// routed (line 240 false branch).
+    #[test]
+    fn route_irq_skipped_when_no_unmasked_raw_bits() {
+        let i = i0();
+        let mut irqs = 0xFFFF_FFFF_FFFF_FFFFu64;
+        let original = irqs;
+        // Manually call route_irq via a tick (which calls it).
+        let mut i = i;
+        i.tick(1, &default_tree(), &mut irqs);
+        // No bit was added (we started full); equally no bit was
+        // removed. The route_irq path doesn't clear, only ORs in.
+        assert_eq!(irqs, original);
+    }
+
+    /// IC_TX_ABRT_SOURCE for 10-bit-master path: assert
+    /// ABRT_10ADDR1_NOACK is set transiently before STOP. We use a
+    /// command WITHOUT DATA_CMD_STOP and observe the source before
+    /// STOP auto-clears it. Covers line 260 (the `if ten_bit` true
+    /// arm). The default IC_CON write doesn't propagate STOP either
+    /// because !ack also asserts STOP; so we must inspect within the
+    /// transaction. Simpler approach: read state right after the
+    /// write; auto-clear *will* have happened, but the path was
+    /// taken (verified by lack of ABRT_7B_ADDR_NOACK). The TX_ABRT
+    /// raw bit latches and is the durable indicator.
+    #[test]
+    fn ten_bit_addressing_takes_ten_bit_arm() {
+        let mut i = i0();
+        let mut irqs = 0u64;
+        i.write32(IC_CON, i.con | IC_CON_10BIT_ADDR_MASTER, 0, &mut irqs);
+        i.write32(IC_TAR, 0x100, 0, &mut irqs); // 10-bit address
+        i.write32(IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(IC_DATA_CMD, 0xAA, 0, &mut irqs);
+        // Latching indicator: TX_ABRT raw bit is set.
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+    }
+
+    /// IC_SAR is writable regardless of enable state.
+    #[test]
+    fn ic_sar_writable_when_enabled() {
+        let mut i = i0();
+        let mut irqs = 0u64;
+        i.write32(IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(IC_SAR, 0x123, 0, &mut irqs);
+        assert_eq!(i.read32(IC_SAR), 0x123);
+    }
+
+    /// reset() returns to power-on defaults preserving the wiring
+    /// constants (irq, dreq tx/rx).
+    #[test]
+    fn reset_preserves_wiring_constants() {
+        let mut i = i0();
+        let mut irqs = 0u64;
+        i.write32(IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(IC_DATA_CMD, 0x33, 0, &mut irqs);
+        assert!(!i.is_idle());
+        i.reset();
+        assert!(i.is_idle());
+        assert_eq!(i.dreq_tx_index(), DREQ_I2C0_TX);
+        assert_eq!(i.dreq_rx_index(), DREQ_I2C0_RX);
+    }
+
+    /// Catch-all read offset returns 0 (line 378).
+    #[test]
+    fn unknown_read_offset_returns_zero() {
+        let mut i = i0();
+        assert_eq!(i.read32(0x1FC), 0);
+    }
+
+    /// Catch-all write offset is a no-op (line 462).
+    #[test]
+    fn unknown_write_offset_is_noop() {
+        let mut i = i0();
+        let mut irqs = 0u64;
+        let snapshot_con = i.con;
+        i.write32(0x1FC, 0xDEAD, 0, &mut irqs);
+        assert_eq!(i.con, snapshot_con);
+    }
 }

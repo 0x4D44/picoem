@@ -11513,3 +11513,550 @@ mod stage3_dma_residue {
         assert_eq!(pending & (1u32 << IRQ_DMA_IRQ_1), 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stage-2/3 residue: branch coverage for `core/{decode,mod,nvic,registers,
+// exceptions}.rs` — final batch.
+//
+// Targets specific tie-break and rejection paths flagged by `cargo llvm-cov`:
+//
+// * core/mod.rs L350 — SysTick beats PendSV when SysTick has lower priority value
+// * core/mod.rs L358 — NVIC IRQ tie-break vs system exception (priority equal,
+//                       exc # higher)
+// * core/mod.rs L363 — `let Some(...) = best else { return 0 }` when no
+//                       candidate is pending (with PRIMASK clear)
+// * core/decode.rs L230 — wide-prefix fetch where the SECOND halfword fetch faults
+// * core/decode.rs L251 — cache writeback skipped on non-cacheable PC
+// * Various IT / CBZ / CBNZ / Thumb-32-prefix rejection arms
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod stage4_core_residue_v2 {
+    use crate::bus::Bus;
+    use crate::core::CortexM0Plus;
+    use crate::core::decode::is_wide;
+
+    /// Helper: lay down a 48-entry vector table at `vtor=0x2000_0000`,
+    /// each handler at `0x2000_1000 + N*32`. Returns `(bus, handlers)`.
+    /// Sized to cover the full 16 system exceptions plus all 26 RP2040
+    /// external IRQs (vectors 16..=41).
+    fn make_bus_with_vectors() -> (Bus, [u32; 48]) {
+        let mut bus = Bus::default();
+        let vtor: u32 = 0x2000_0000;
+        let mut handlers = [0u32; 48];
+        for i in 0..48 {
+            let h = 0x2000_1000 + (i as u32) * 32;
+            bus.write32(vtor + (i as u32) * 4, h | 1);
+            handlers[i] = h;
+        }
+        bus.ppb[0].vtor = vtor;
+        (bus, handlers)
+    }
+
+    fn fresh_cpu() -> CortexM0Plus {
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.set_sp(0x2000_8000);
+        cpu.regs.set_pc(0x2000_4000);
+        cpu
+    }
+
+    /// Plant `B .` at `addr` so a no-dispatch step decodes a benign loop.
+    fn plant_self_loop(bus: &mut Bus, addr: u32) {
+        bus.write16(addr, 0xE7FE);
+    }
+
+    // -------- core/mod.rs: try_take_any_pending_exception tie-breaks ---------
+
+    /// L350 — SysTick wins over PendSV when SysTick has strictly lower
+    /// numerical priority (= higher architectural priority). Drives the
+    /// `Some((bp, be)) if p < bp || ...` arm where the `p < bp` half is
+    /// TRUE and the candidate flips from PendSV → SysTick.
+    #[test]
+    fn systick_wins_over_pendsv_when_lower_priority_value() {
+        let (mut bus, handlers) = make_bus_with_vectors();
+        plant_self_loop(&mut bus, 0x2000_4000);
+        let mut cpu = fresh_cpu();
+        // PendSV = SHPR3[10] = 0xC0 (lowest architectural prio).
+        bus.ppb[0].shpr[10] = 0xC0;
+        // SysTick = SHPR3[11] = 0x40 (higher architectural prio).
+        bus.ppb[0].shpr[11] = 0x40;
+        bus.ppb[0].icsr |= (1 << 28) | (1 << 26);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(
+            cpu.regs.ipsr(),
+            15,
+            "SysTick (prio 0x40) must win over PendSV (prio 0xC0)"
+        );
+        assert_eq!(cpu.regs.pc(), handlers[15]);
+        assert_eq!(bus.ppb[0].icsr & (1 << 26), 0, "PENDSTSET cleared");
+        assert_ne!(bus.ppb[0].icsr & (1 << 28), 0, "PENDSVSET stays latched");
+    }
+
+    /// L351 — `other => other` arm of the SysTick match: PendSV already
+    /// holds best at lower priority value; SysTick is also pending but has
+    /// HIGHER (worse) priority value. PendSV must remain best.
+    #[test]
+    fn pendsv_keeps_lead_over_systick_with_worse_priority() {
+        let (mut bus, handlers) = make_bus_with_vectors();
+        plant_self_loop(&mut bus, 0x2000_4000);
+        let mut cpu = fresh_cpu();
+        bus.ppb[0].shpr[10] = 0x40; // PendSV — better
+        bus.ppb[0].shpr[11] = 0xC0; // SysTick — worse
+        bus.ppb[0].icsr |= (1 << 28) | (1 << 26);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.regs.ipsr(), 14, "PendSV holds the lead");
+        assert_eq!(cpu.regs.pc(), handlers[14]);
+        assert_eq!(bus.ppb[0].icsr & (1 << 28), 0, "PENDSVSET cleared");
+        assert_ne!(bus.ppb[0].icsr & (1 << 26), 0, "PENDSTSET stays latched");
+    }
+
+    /// L358 — NVIC IRQ tie-break: PendSV pending at priority 0x40, IRQ
+    /// pending at priority 0x40, exc # 16 vs 14. System exception (#14)
+    /// wins by tie-break (lower exc number). Drives the
+    /// `(p == bp && exc < be)` half which is FALSE here, falling to
+    /// `other => other`.
+    #[test]
+    fn pendsv_outranks_irq_on_equal_priority_tie_break() {
+        let (mut bus, handlers) = make_bus_with_vectors();
+        plant_self_loop(&mut bus, 0x2000_4000);
+        let mut cpu = fresh_cpu();
+        bus.ppb[0].shpr[10] = 0x40; // PendSV
+        bus.ppb[0].icsr |= 1 << 28;
+        bus.nvics[0].set_priority(0, 0x40);
+        bus.nvics[0].set_enabled(0);
+        bus.nvics[0].set_pending(0);
+
+        cpu.step(&mut bus);
+
+        // IRQ 0 → exc 16. Tie-break: 14 < 16 → PendSV wins.
+        assert_eq!(cpu.regs.ipsr(), 14, "tie-break by exc # → PendSV");
+        assert_eq!(cpu.regs.pc(), handlers[14]);
+        assert!(bus.nvics[0].is_pending(0), "NVIC pending stays latched");
+    }
+
+    /// L358 — NVIC IRQ wins by strictly lower priority value over a
+    /// system exception. Drives the `p < bp` half of the inner guard.
+    #[test]
+    fn nvic_irq_wins_over_systick_with_lower_priority() {
+        let (mut bus, handlers) = make_bus_with_vectors();
+        plant_self_loop(&mut bus, 0x2000_4000);
+        let mut cpu = fresh_cpu();
+        bus.ppb[0].shpr[11] = 0xC0; // SysTick — worst
+        bus.ppb[0].icsr |= 1 << 26;
+        bus.nvics[0].set_priority(7, 0x40); // IRQ 7 — better
+        bus.nvics[0].set_enabled(7);
+        bus.nvics[0].set_pending(7);
+
+        cpu.step(&mut bus);
+
+        // IRQ 7 → exc 23. Lower priority value wins.
+        assert_eq!(
+            cpu.regs.ipsr(),
+            23,
+            "IRQ 7 (prio 0x40) beats SysTick (prio 0xC0)"
+        );
+        assert_eq!(cpu.regs.pc(), handlers[16].wrapping_add(7 * 32));
+        assert!(!bus.nvics[0].is_pending(7));
+        assert_ne!(bus.ppb[0].icsr & (1 << 26), 0, "SysTick stays latched");
+    }
+
+    /// L363 — `let Some((_, candidate)) = best else { return 0 }` taken
+    /// when PRIMASK is clear AND no candidate is pending. Drives the
+    /// `else { return 0 }` arm with PRIMASK=0 (distinct from the
+    /// already-covered PRIMASK=1 path at L330).
+    #[test]
+    fn no_candidates_returns_zero_with_primask_clear() {
+        let (mut bus, _handlers) = make_bus_with_vectors();
+        plant_self_loop(&mut bus, 0x2000_4000);
+        let mut cpu = fresh_cpu();
+        // PRIMASK=0, ICSR clean, no enabled/pending NVIC IRQ. Step must
+        // execute the self-loop instruction, NOT enter any handler.
+        cpu.regs.primask = 0;
+        bus.ppb[0].icsr = 0;
+
+        let cycles = cpu.step(&mut bus);
+
+        assert_eq!(cpu.regs.ipsr(), 0, "no exception entered");
+        // Self-loop returns to its own PC; just verify we billed instruction
+        // cycles (>=1) rather than 16 (exception entry cost).
+        assert!(cycles < 16, "no exception cost incurred (cycles={cycles})");
+    }
+
+    /// L364 — `if !self.can_dispatch_now(bus) { return 0 }` taken when a
+    /// pending NVIC IRQ exists but a system exception is already active.
+    /// Distinguishes from the existing `pendsv_blocked_by_active_handler`
+    /// test (which exercises PendSV-blocked, not NVIC-blocked).
+    #[test]
+    fn nvic_dispatch_blocked_by_active_handler() {
+        let (mut bus, _handlers) = make_bus_with_vectors();
+        plant_self_loop(&mut bus, 0x2000_4000);
+        let mut cpu = fresh_cpu();
+        // SVCall (#11) marked active without entering it.
+        bus.ppb[0].mark_active(11);
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 11;
+        // Pending NVIC IRQ at high priority.
+        bus.nvics[0].set_priority(3, 0x00);
+        bus.nvics[0].set_enabled(3);
+        bus.nvics[0].set_pending(3);
+
+        cpu.step(&mut bus);
+
+        // V1 dispatch gate must keep us inside SVCall.
+        assert_eq!(cpu.regs.ipsr(), 11, "active handler blocks new dispatch");
+        assert!(bus.nvics[0].is_pending(3), "NVIC pending preserved");
+    }
+
+    // -------- core/decode.rs: rejection / fetch-fault / cache paths ---------
+
+    /// L230 — `populate_decode_cache` second-halfword fetch fault: a
+    /// wide-prefix instruction whose `hw1` fetch lands in unmapped space.
+    /// Drives the `if wide && bus.bus_fault()` early return.
+    #[test]
+    fn wide_instr_with_hw1_fetch_fault_escalates_to_hardfault() {
+        let (mut bus, handlers) = make_bus_with_vectors();
+        let mut cpu = fresh_cpu();
+        // Place hw0 at the END of SRAM bank0, so hw1 lies just past the
+        // end of SRAM in unmapped space. SRAM on RP2040 is at 0x2000_0000
+        // for 264 KB → unmapped at 0x2004_2000+.
+        // Instead: place hw0 at the very last halfword of SRAM (4-byte
+        // unalignedment) and let hw1 fetch from the unmapped region.
+        // SRAM ends at 0x2004_2000 on RP2040.
+        let last = 0x2004_1FFEu32; // last halfword in SRAM
+        bus.write16(last, 0xF000); // wide prefix
+        cpu.regs.set_pc(last);
+        bus.clear_bus_fault();
+        let _ = cpu.step(&mut bus);
+        // Bus fault should have triggered HardFault entry.
+        assert_eq!(
+            cpu.regs.ipsr(),
+            3,
+            "hw1 fetch fault must escalate to HardFault"
+        );
+        assert_eq!(cpu.regs.pc(), handlers[3]);
+    }
+
+    /// L251 — `populate_decode_cache` skips writeback when the PC is not
+    /// cacheable. Drives the `if is_cacheable_pc(pc)` FALSE arm.
+    #[test]
+    fn populate_skips_writeback_for_noncacheable_pc() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        // PPB region (0xE000_0000) is not cacheable per `is_cacheable_pc`
+        // (only ROM/XIP/SRAM = nibbles 0x0..=0x2 qualify). Reads return
+        // zero / fault depending on address — we just need a valid read16
+        // that does not bus-fault. Use ROM-image read at PPB — actually
+        // any non-cacheable region will faulting. Pick the ROM region but
+        // exercise the FALSE arm using a forged is-cacheable-failing PC.
+        //
+        // Best path: place the instruction in SRAM (cacheable), populate,
+        // then read decode_execute on a SECOND PC in SIO region (region
+        // 0xD) which falls outside ROM/XIP/SRAM. SIO base 0xD000_0000.
+        //
+        // Note: SIO doesn't host code; reads return register values, so
+        // hw0 will be whatever SIO returns. We just need to verify the
+        // cache slot for that PC stays empty.
+        let pc_sio = 0xD000_0000u32;
+        let slot = ((pc_sio >> 1) & (crate::bus::DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        let initial_tag = cpu.decode_cache[slot].tag;
+        cpu.regs.set_pc(pc_sio);
+        // Step the decode_execute pipeline — fetch will read SIO MMIO
+        // and may dispatch to whatever bytes come back. This may or may
+        // not bus-fault; the assertion is purely about the cache state
+        // afterwards.
+        let _ = cpu.decode_execute(&mut bus);
+        // The slot must NOT have been populated with `pc_sio` as the tag
+        // — non-cacheable PCs skip the cache writeback.
+        assert_ne!(
+            cpu.decode_cache[slot].tag, pc_sio,
+            "non-cacheable PC must not populate cache slot"
+        );
+        // (If decode_execute didn't bus-fault, the slot keeps its initial
+        // tag value; if it did, same outcome.)
+        assert_eq!(cpu.decode_cache[slot].tag, initial_tag);
+    }
+
+    /// L191 — `if entry.is_wide()` TRUE arm: cache hit for a wide
+    /// instruction routes to `execute_thumb32` and bumps PC by 4.
+    #[test]
+    fn cache_hit_wide_dispatches_thumb32_path() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        let pc = 0x2000_0000u32;
+        // BL +4: hw0=0xF000, hw1=0xF802.
+        bus.write16(pc, 0xF000);
+        bus.write16(pc + 2, 0xF802);
+        cpu.regs.set_pc(pc);
+        // First call populates the cache.
+        cpu.decode_execute(&mut bus);
+        // PC has now advanced (BL branched to pc+4+4 = pc+8). Re-set PC
+        // to the original to drive the cache hit a second time.
+        cpu.regs.set_pc(pc);
+        cpu.decode_execute(&mut bus);
+        // After cache-hit dispatch, PC must again be the BL target
+        // (pc + 4 + 4 = pc + 8). This proves we took the wide-cache-hit
+        // path and dispatched into execute_thumb32.
+        assert_eq!(cpu.regs.lr(), (pc + 4) | 1);
+        assert_eq!(cpu.regs.pc(), pc + 8);
+    }
+
+    /// L178 — cache slot lookup MISS path with cacheable PC. The slot
+    /// already holds a different tag, so the `e.tag == pc` check fails
+    /// and `populate_decode_cache` runs.
+    #[test]
+    fn cache_miss_on_collision_repopulates() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        // Pre-poison the slot for PC=0x2000_0000 with a foreign tag.
+        let pc = 0x2000_0000u32;
+        let slot = ((pc >> 1) & (crate::bus::DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        cpu.decode_cache[slot].tag = 0x1234_5678;
+        cpu.decode_cache[slot].hw0 = 0xDEAD;
+        bus.write16(pc, 0x3001); // ADDS r0, r0, #1
+        cpu.regs.set_pc(pc);
+        cpu.decode_execute(&mut bus);
+        // Cache slot now holds the real instruction.
+        assert_eq!(cpu.decode_cache[slot].tag, pc);
+        assert_eq!(cpu.decode_cache[slot].hw0, 0x3001);
+        assert_eq!(cpu.regs.r[0], 1);
+    }
+
+    // -------- core/decode.rs: rejection paths --------------------------------
+
+    /// `is_wide` rejects the M33 wide prefix `0b11101` — first halfword
+    /// 0xE800. Pinned for documentation; complements
+    /// `dispatch_catch_all_for_11111_prefix` already in stage2 residue.
+    #[test]
+    fn is_wide_rejects_m33_only_prefixes() {
+        // 0b11101 (0xE800..0xEFFF) — Thumb-32 on M33 only.
+        for hw0 in [0xE800u16, 0xE900, 0xEA00, 0xEB00, 0xEC00, 0xED00, 0xEE00, 0xEF00] {
+            assert!(!is_wide(hw0), "{hw0:#06x} is M33-only wide");
+        }
+        // 0b11111 (0xF800..0xFFFF) — Thumb-32 on M33 only.
+        for hw0 in [0xF800u16, 0xF900, 0xFA00, 0xFB00, 0xFC00, 0xFD00, 0xFE00, 0xFF00] {
+            assert!(!is_wide(hw0), "{hw0:#06x} is M33-only wide");
+        }
+        // 0b11110 IS the M0+ wide prefix.
+        for hw0 in [0xF000u16, 0xF100, 0xF200, 0xF300, 0xF400, 0xF500, 0xF600, 0xF700] {
+            assert!(is_wide(hw0), "{hw0:#06x} is the M0+ wide prefix");
+        }
+    }
+
+    /// IT encoding rejection — drives the `mask != 0` guard in the hint
+    /// dispatch with every nonzero mask. (`stage2_core_residue` covers
+    /// the 1..16 sweep; this complements with all 16 bit patterns of the
+    /// `firstcond` field for mask=1, the canonical IT encoding.)
+    #[test]
+    fn it_with_every_firstcond_is_undefined() {
+        for cond in 0u16..=0xF {
+            let mut cpu = CortexM0Plus::new();
+            // 0xBF<cond>1 — IT firstcond=cond, mask=0001.
+            let opcode = 0xBF00 | (cond << 4) | 0x1;
+            cpu.execute_one(opcode);
+            assert!(
+                cpu.has_pending_fault(),
+                "IT firstcond={cond:#x} mask=1 must be undefined ({opcode:#06x})",
+            );
+        }
+    }
+
+    /// CBZ / CBNZ rejection — the exhaustive bit-pattern sweep across
+    /// the four CBZ/CBNZ misc-group sub-ops on M0+.
+    #[test]
+    fn cbz_cbnz_full_subop_sweep() {
+        // Misc encoding 0xB1xx, 0xB3xx, 0xB9xx, 0xBBxx — base bytes for
+        // CBZ/CBNZ. Sweep low byte to confirm the catch-all undefined arm.
+        for high in [0xB1u16, 0xB3, 0xB9, 0xBB] {
+            for low in [0x00u16, 0x07, 0x40, 0xFF] {
+                let mut cpu = CortexM0Plus::new();
+                let opcode = (high << 8) | low;
+                cpu.execute_one(opcode);
+                assert!(
+                    cpu.has_pending_fault(),
+                    "CBZ/CBNZ {opcode:#06x} must be undefined on M0+",
+                );
+            }
+        }
+    }
+
+    // -------- MSR control: SP banking on SPSEL flip --------------------------
+
+    /// MSR CONTROL flipping SPSEL=1→0 in thread mode rebases r[13] to
+    /// MSP. Already covered for the 0→1 direction by
+    /// `msr_writes_control_thread_mode`; this exercises the inverse arm.
+    #[test]
+    fn msr_control_clears_spsel_to_msp() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_0100;
+        cpu.regs.psp = 0x2000_0200;
+        // Start in PSP mode.
+        cpu.regs.control = 0x2;
+        cpu.regs.set_sp(0x2000_0200);
+        cpu.regs.r[3] = 0x0; // SPSEL=0 — back to MSP.
+        // hw0=0xF383, hw1=0x8814 — MSR CONTROL, r3.
+        cpu.execute_one_wide(0xF383, 0x8814);
+        assert_eq!(cpu.regs.control, 0x0, "SPSEL cleared");
+        // SP must now read MSP.
+        assert_eq!(cpu.regs.sp(), 0x2000_0100);
+    }
+
+    /// MSR CONTROL ignored in handler mode (CONTROL.SPSEL is RAZ in
+    /// handler mode per ARMv6-M ARM B5.2.3). Drives the handler-mode
+    /// branch in `execute_thumb32`'s MSR path.
+    #[test]
+    fn msr_control_ignored_in_handler_mode() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.regs.msp = 0x2000_0100;
+        cpu.regs.psp = 0x2000_0200;
+        cpu.regs.set_sp(0x2000_0100);
+        // Force handler mode: IPSR=2 (NMI).
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 2;
+        // Pre-write CONTROL.SPSEL=0.
+        cpu.regs.control = 0x0;
+        cpu.regs.r[3] = 0x2; // attempt SPSEL=1.
+        cpu.execute_one_wide(0xF383, 0x8814);
+        // SPSEL must remain 0 in handler mode (writes ignored).
+        assert_eq!(cpu.regs.control & 0x2, 0, "SPSEL write ignored in handler");
+    }
+
+    // -------- core/mod.rs: invalidate_decode_cache_regions --------------------
+
+    /// L460/463 — region BULK bit takes precedence: every slot is
+    /// cleared regardless of region tag. Drives the `regions & BULK != 0`
+    /// arm with a populated cache.
+    #[test]
+    fn region_bulk_bit_clears_every_slot() {
+        let mut cpu = CortexM0Plus::new();
+        // Populate slots from three different regions.
+        cpu.decode_cache[3].tag = 0x0000_0006; // ROM
+        cpu.decode_cache[7].tag = 0x1000_000E; // XIP
+        cpu.decode_cache[11].tag = 0x2000_0016; // SRAM
+        // BULK alongside other region bits — the BULK guard must win.
+        cpu.invalidate_decode_cache_regions(
+            crate::bus::invalidation_regions::BULK
+                | crate::bus::invalidation_regions::ROM,
+        );
+        for slot in cpu.decode_cache.iter() {
+            assert_eq!(slot.tag, u32::MAX, "BULK clears every slot");
+        }
+    }
+
+    /// L472 — the region-match path: cached entry whose region nibble is
+    /// in `regions` gets cleared; entries from other regions survive.
+    /// Drives both the FALSE (skip) and TRUE (clear) inner branches.
+    #[test]
+    fn region_scoped_invalidate_drops_only_matching_region() {
+        let mut cpu = CortexM0Plus::new();
+        // Pick three slots; pre-populate them with tags from distinct
+        // regions to drive both the match (clear) and no-match (skip)
+        // halves of the inner conditional.
+        cpu.decode_cache[2].tag = 0x0000_1004; // ROM (nibble 0)
+        cpu.decode_cache[2].hw0 = 0xAAAA;
+        cpu.decode_cache[4].tag = 0x1000_2008; // XIP (nibble 1)
+        cpu.decode_cache[4].hw0 = 0xBBBB;
+        cpu.decode_cache[6].tag = 0x2000_300C; // SRAM (nibble 2)
+        cpu.decode_cache[6].hw0 = 0xCCCC;
+        // Sweep ROM only — the SRAM and XIP slots must survive.
+        cpu.invalidate_decode_cache_regions(crate::bus::invalidation_regions::ROM);
+        assert_eq!(cpu.decode_cache[2].tag, u32::MAX, "ROM slot cleared");
+        assert_eq!(cpu.decode_cache[4].tag, 0x1000_2008, "XIP slot survives");
+        assert_eq!(cpu.decode_cache[6].tag, 0x2000_300C, "SRAM slot survives");
+    }
+
+    /// Combined region mask: ROM | XIP must clear both, leaving SRAM.
+    #[test]
+    fn region_combined_mask_clears_listed_regions() {
+        let mut cpu = CortexM0Plus::new();
+        cpu.decode_cache[2].tag = 0x0000_1004; // ROM
+        cpu.decode_cache[4].tag = 0x1000_2008; // XIP
+        cpu.decode_cache[6].tag = 0x2000_300C; // SRAM
+        let regions = crate::bus::invalidation_regions::ROM
+            | crate::bus::invalidation_regions::XIP;
+        cpu.invalidate_decode_cache_regions(regions);
+        assert_eq!(cpu.decode_cache[2].tag, u32::MAX);
+        assert_eq!(cpu.decode_cache[4].tag, u32::MAX);
+        assert_eq!(cpu.decode_cache[6].tag, 0x2000_300C);
+    }
+
+    // -------- core/exceptions.rs: extra entry / return / fault arms ---------
+
+    /// `Fault::Svc` with PRIMASK=1 escalates to HardFault inside
+    /// `deliver_fault`. Drives the SVC arm of the deliver_fault match
+    /// AND the PRIMASK=1 → enter_exception(3) branch within it.
+    /// Existing test `step_primask_escalates_svc_to_hardfault` covers
+    /// the same path through `step`; this one is a direct
+    /// `pending_fault = Svc; step` driver to ensure the arm is hit.
+    #[test]
+    fn svc_with_primask_escalates_to_hardfault_via_pending_fault() {
+        let (mut bus, handlers) = make_bus_with_vectors();
+        let mut cpu = fresh_cpu();
+        cpu.regs.primask = 1;
+        // Stage SVC fault directly; step delivers it via deliver_fault.
+        cpu.pending_fault = Some(crate::core::Fault::Svc);
+        // Plant a self-loop so the post-fault step doesn't re-fault.
+        plant_self_loop(&mut bus, 0x2000_4000);
+        cpu.step(&mut bus);
+        // PRIMASK=1 → SVC escalated to HardFault (#3), not SVCall (#11).
+        assert_eq!(cpu.regs.ipsr(), 3, "SVC escalated to HardFault");
+        assert_eq!(cpu.regs.pc(), handlers[3]);
+    }
+
+    /// `Fault::InvalidEpsr` enters HardFault. Drives the
+    /// `Fault::InvalidEpsr => enter_exception(3, ...)` arm of
+    /// `deliver_fault`'s catch-all match.
+    #[test]
+    fn invalid_epsr_fault_delivers_hardfault() {
+        let (mut bus, handlers) = make_bus_with_vectors();
+        let mut cpu = fresh_cpu();
+        cpu.pending_fault = Some(crate::core::Fault::InvalidEpsr);
+        plant_self_loop(&mut bus, 0x2000_4000);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 3);
+        assert_eq!(cpu.regs.pc(), handlers[3]);
+    }
+
+    /// `Fault::Unaligned` enters HardFault.
+    #[test]
+    fn unaligned_fault_delivers_hardfault() {
+        let (mut bus, handlers) = make_bus_with_vectors();
+        let mut cpu = fresh_cpu();
+        cpu.pending_fault = Some(crate::core::Fault::Unaligned);
+        plant_self_loop(&mut bus, 0x2000_4000);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 3);
+        assert_eq!(cpu.regs.pc(), handlers[3]);
+    }
+
+    /// HardFault-in-HardFault → core lockup. Drives the
+    /// `if exc_num == 3 && self.regs.ipsr() == 3 { halted = true }` arm
+    /// in `enter_exception`.
+    #[test]
+    fn hardfault_in_hardfault_locks_up_core() {
+        let (mut bus, _handlers) = make_bus_with_vectors();
+        let mut cpu = fresh_cpu();
+        // Force IPSR = 3 (already in HardFault).
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 3;
+        let cycles = cpu.test_enter_exception(3, &mut bus);
+        assert!(cpu.is_halted(), "HardFault-in-HardFault must lock up");
+        assert_eq!(cycles, 0, "lockup returns 0 cycles");
+    }
+
+    /// `enter_exception` with a vector whose T-bit is clear AND we're
+    /// entering HardFault → lockup (not escalation, since we're already
+    /// at HardFault). Drives the dual `exc_num == 3 && vector & 1 == 0`
+    /// arm at line 135-138.
+    #[test]
+    fn hardfault_with_t0_vector_locks_up() {
+        let (mut bus, _handlers) = make_bus_with_vectors();
+        let mut cpu = fresh_cpu();
+        // Corrupt HardFault vector — strip the T bit.
+        bus.write32(0x2000_0000 + 3 * 4, 0x2000_2000); // no T bit
+        let cycles = cpu.test_enter_exception(3, &mut bus);
+        assert!(cpu.is_halted(), "HardFault with bad vector locks up");
+        assert_eq!(cycles, 16, "lockup still bills 16 entry cycles");
+    }
+}

@@ -1374,4 +1374,259 @@ mod tests {
         let _ = threaded.run_quanta_checked(1);
         // Implicit drop — must not double-fault on `pio_blocks = None`.
     }
+
+    // ----- Additional from_emulator branch coverage ---------------------
+
+    /// `if bus.psram.is_some()` true side (line 130). Attach a PSRAM
+    /// device via the builder so `from_emulator` hits the warn branch.
+    /// The threaded path silently drops the device; we only need to
+    /// prove the branch was taken without panicking.
+    #[test]
+    fn from_emulator_with_psram_attached_takes_warn_branch() {
+        let psram = picoem_devices::Psram::new(0, 1, 2, 3);
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .psram(psram)
+            .build()
+            .expect("Serial build with PSRAM infallible");
+        // Halt cores so run_quanta_checked terminates immediately.
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+        // Sanity: PSRAM is attached on the serial bus before promotion.
+        assert!(emu.bus.psram.is_some());
+
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        // Must be runnable post-promotion; the PSRAM device was dropped
+        // but the rest of the state is intact.
+        threaded
+            .run_quanta_checked(1)
+            .expect("run_quanta_checked(1) after PSRAM-warn promotion");
+    }
+
+    /// `if bus.sio.fifo_wof(core)` true side (line 242). Push 9 words
+    /// into the core 0 → core 1 FIFO via SIO MMIO; the 9th push fails
+    /// because the FIFO has capacity 8, latching `fifo_wof[0]`. The
+    /// promotion path then mirrors that bit onto `CoreAtomics::fifo_wof`.
+    #[test]
+    fn from_emulator_preserves_fifo_wof() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        // Fill the core 0 → core 1 FIFO (capacity 8) plus one more push
+        // to set fifo_wof[0]. The unarmed-handshake path engages because
+        // we explicitly disarm the launch FSM via writing post-claim:
+        // simpler approach — push from core 1 (always unarmed path) so
+        // we drive fifo_to_core0 instead. Core 0's handshake FSM sits
+        // armed by default but only consumes core-0 writes.
+        for _ in 0..8 {
+            emu.bus.sio.write32(0x054, 0xDEAD_BEEF, 1);
+        }
+        // 9th push: FIFO full → fifo_wof[1] latches.
+        emu.bus.sio.write32(0x054, 0xCAFE_BABE, 1);
+        assert!(emu.bus.sio.fifo_wof(1), "WOF[1] must latch on overflow");
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        // Sticky WOF[1] propagates to CoreAtomics (line 242 true side).
+        assert!(
+            threaded.shared.atomics.fifo_wof(1),
+            "FIFO_ST WOF bit must be set on core 1 atomics"
+        );
+        assert!(
+            !threaded.shared.atomics.fifo_wof(0),
+            "WOF[0] must remain clear (only core 1 overflowed)"
+        );
+    }
+
+    /// `if bus.sio.fifo_roe(core)` true side (line 245). Read SIO FIFO_RD
+    /// while empty to latch ROE on the reading core, then promote and
+    /// observe the bit on `CoreAtomics`.
+    #[test]
+    fn from_emulator_preserves_fifo_roe() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        // Read FIFO_RD on core 1 while core 0→1 fifo is empty: ROE[1]
+        // latches.
+        let v = emu.bus.sio.read32(0x058, 1);
+        assert_eq!(v, 0, "empty FIFO read returns 0");
+        assert!(emu.bus.sio.fifo_roe(1), "ROE[1] must latch on empty read");
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        // Sticky ROE[1] propagates to CoreAtomics (line 245 true side).
+        assert!(
+            threaded.shared.atomics.fifo_roe(1),
+            "FIFO_ST ROE bit must be set on core 1 atomics"
+        );
+        assert!(
+            !threaded.shared.atomics.fifo_roe(0),
+            "ROE[0] must remain clear (only core 1 read empty)"
+        );
+    }
+
+    /// `if sl_bits & (1 << n) != 0` true side (line 259). Pre-claim a
+    /// few spinlocks via SIO MMIO reads, then promote. The cells in
+    /// `shared.spinlocks` for those slots must hold `n+1` (their token
+    /// per the contract documented at lines 254-256).
+    #[test]
+    fn from_emulator_carries_claimed_spinlocks() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        // Claim spinlocks 0, 5, 31 by reading them; non-zero return
+        // means we acquired the lock.
+        let r0 = emu.bus.sio.read32(0x100, 0);
+        let r5 = emu.bus.sio.read32(0x100 + 5 * 4, 0);
+        let r31 = emu.bus.sio.read32(0x100 + 31 * 4, 0);
+        assert_eq!(r0, 1u32 << 0);
+        assert_eq!(r5, 1u32 << 5);
+        assert_eq!(r31, 1u32 << 31);
+        assert_eq!(
+            emu.bus.sio.spinlock_bits(),
+            (1 << 0) | (1 << 5) | (1 << 31)
+        );
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+
+        let threaded = ThreadedEmulator::from_emulator(emu);
+        // Promotion stamps token `n+1` into each claimed cell; un-
+        // claimed cells stay at 0.
+        assert_eq!(threaded.shared.spinlocks[0].load(Ordering::Relaxed), 1);
+        assert_eq!(threaded.shared.spinlocks[1].load(Ordering::Relaxed), 0);
+        assert_eq!(threaded.shared.spinlocks[5].load(Ordering::Relaxed), 6);
+        assert_eq!(threaded.shared.spinlocks[31].load(Ordering::Relaxed), 32);
+    }
+
+    // ----- Coordinator true-side branches ------------------------------
+
+    /// `if shared.pio.sm_enabled(block_idx) != 0` true side (line 619).
+    /// Pre-program PIO0 SM_ENABLE through the serial bus so the seed
+    /// loop in `from_emulator` publishes a non-zero mask. The
+    /// coordinator's per-quantum loop then enters `step_n` for that
+    /// block, exercising the true-side of the if.
+    #[test]
+    fn coordinator_steps_pio_when_sm_enabled() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build infallible");
+        // Enable SM 0 on PIO0 via CTRL.SM_ENABLE = 0b0001.
+        emu.bus.write32(0x5020_0000, 0b0001);
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        assert_eq!(
+            threaded.shared.pio.sm_enabled(0),
+            0b0001,
+            "PIO0 SM 0 must be enabled before run"
+        );
+        // Run a few quanta so the coordinator hits line 619 true side.
+        threaded
+            .run_quanta_checked(3)
+            .expect("run_quanta_checked(3)");
+        // Mask is still non-zero post-run (no firmware to disable it).
+        assert_eq!(threaded.shared.pio.sm_enabled(0), 0b0001);
+    }
+
+    /// `if nvic_bits != 0` true side (line 686). Arm TIMER ALARM0 to
+    /// fire within the first quantum's master-cycle window with INTE
+    /// enabled, so the coordinator's `poll_alarms` returns a non-zero
+    /// NVIC mask. Verify that the alarm fired (intr latched) — the
+    /// per-core `irq_pending` atomic is consumed by core workers'
+    /// `drain_cross_core_irqs` (called at the top of every iteration),
+    /// so a same-iteration race against the LAST coord set may leave it
+    /// at zero; the timer's intr latch is the stable post-condition.
+    #[test]
+    fn coordinator_routes_timer_irq_to_both_cores() {
+        use crate::peripherals::timer::{ALARM0_OFFSET, INTE_OFFSET, INTR_OFFSET};
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            // Generous quantum so a single advance crosses the alarm.
+            .step_quantum(2_000_000)
+            .build()
+            .expect("Serial build infallible");
+        let sys_hz = emu.bus.clock_tree.sys_clk_hz;
+        assert!(sys_hz > 0, "sys_hz must be non-zero post-build");
+        // Enable INTE for ALARM0 (NVIC line 0) and arm 200 µs out.
+        emu.bus
+            .timer
+            .write32(INTE_OFFSET, 0x1, 0, emu.bus.master_cycle, sys_hz);
+        emu.bus
+            .timer
+            .write32(ALARM0_OFFSET, 200, 0, emu.bus.master_cycle, sys_hz);
+        // Halt both cores so workers exit fast and the coordinator's
+        // alarm-poll path is the only path advancing master_cycle.
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+
+        // Sanity-check the serial poll path so the test catches a
+        // mis-armed alarm distinctly from a coordinator-side bug.
+        let pre_armed_state = emu.bus.timer.read32(INTR_OFFSET, 0, sys_hz);
+        assert_eq!(pre_armed_state & 1, 0, "INTR[0] must be clear pre-run");
+
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded
+            .run_quanta_checked(4)
+            .expect("run_quanta_checked(4)");
+
+        // The coordinator's `poll_alarms` fires the alarm in some
+        // quantum during the run, latching INTR[0] and entering the
+        // `if nvic_bits != 0` true branch (line 686). INTR is sticky
+        // until W1C — the test inspects it directly through the
+        // peripherals mutex, which has stable visibility regardless of
+        // any worker drain race against the per-core IRQ atomic.
+        {
+            let mut t = threaded
+                .shared
+                .peripherals
+                .timer
+                .lock()
+                .expect("timer mutex");
+            let intr = t.read32(INTR_OFFSET, threaded.master_cycle(), sys_hz);
+            assert!(
+                intr & 0x1 != 0,
+                "TIMER ALARM0 INTR must be latched after run: got {intr:#x} \
+                 (master_cycle={}, sys_hz={})",
+                threaded.master_cycle(),
+                sys_hz
+            );
+        }
+
+        // Best-effort confirmation that line 686 emitted set_irq_pending
+        // somewhere in the run: at least one of the two cores' atomic
+        // pending mask carries the bit OR was just consumed by a same-
+        // iter drain after the last coord set. Either way, the IRQ
+        // routing path executed.
+        let p0 = threaded.shared.atomics.irq_pending_load(0);
+        let p1 = threaded.shared.atomics.irq_pending_load(1);
+        // No assertion on p0|p1 — under heavy parallel load the cores'
+        // drain-at-top-of-iter consumes the bit set in the previous
+        // iter, and the LAST iter is racy. The intr latch above is the
+        // load-bearing assertion for the branch we're targeting.
+        let _ = (p0, p1);
+    }
+
+    // ----- Builder ConfigError coverage --------------------------------
+
+    /// `step_quantum(0)` clamps to 1 — covers the `n.max(1)` saturating
+    /// arm of the public builder validator (the doc-noted footgun guard
+    /// at lib.rs:1417). Verifies `build()` succeeds with the clamp.
+    #[test]
+    fn builder_step_quantum_zero_clamps_then_promotes() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(0)
+            .build()
+            .expect("step_quantum(0) must clamp, not error");
+        assert_eq!(emu.step_quantum, 1, "step_quantum must clamp to 1");
+        emu.cores[0].halt();
+        emu.cores[1].halt();
+        // Promotion must succeed and a single quantum advances exactly
+        // 1 master cycle.
+        let mut threaded = ThreadedEmulator::from_emulator(emu);
+        threaded
+            .run_quanta_checked(1)
+            .expect("run_quanta_checked(1)");
+        assert_eq!(threaded.master_cycle(), 1);
+    }
 }

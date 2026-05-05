@@ -715,6 +715,204 @@ mod tests {
         assert!(barrier.timeout_elapsed_ms() >= DEADLINE.as_millis() as u32);
     }
 
+    /// Targets L229: watchdog tripped during spin (the
+    /// `start.elapsed() >= self.deadline` arm of the compound
+    /// stride-and-deadline check). Tiny 50 ms deadline + a sole waiter
+    /// so the spawned thread races through SPIN_BUDGET=512 iterations
+    /// in well under 50 ms, then keeps spinning until the watchdog
+    /// stride hits and the elapsed-time check trips. The other party
+    /// (this test thread) never arrives.
+    #[test]
+    fn watchdog_trips_during_spin_2party_50ms() {
+        const DEADLINE: Duration = Duration::from_millis(50);
+        let barrier = Arc::new(SpinBarrier::with_deadline(2, DEADLINE));
+        let b = Arc::clone(&barrier);
+
+        let r = thread::spawn(move || b.wait())
+            .join()
+            .expect("waiter panicked");
+
+        match r {
+            BarrierResult::TimedOut { elapsed_ms } => {
+                // 30 ms slack on the lower bound for slow CI hosts.
+                assert!(
+                    elapsed_ms >= 30,
+                    "elapsed_ms {elapsed_ms} should be at least 30 (deadline 50)"
+                );
+            }
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        assert!(barrier.timed_out());
+    }
+
+    /// Targets L253: watchdog fires from the park path when the
+    /// condvar `wait_timeout` returns with `remaining == 0`. Uses a
+    /// 200 ms deadline so the spin budget (~10 μs) is utterly
+    /// dwarfed and the waiter is guaranteed to be parked when the
+    /// deadline elapses.
+    #[test]
+    fn watchdog_trips_during_sleep_2party_200ms() {
+        const DEADLINE: Duration = Duration::from_millis(200);
+        let barrier = Arc::new(SpinBarrier::with_deadline(2, DEADLINE));
+        let b = Arc::clone(&barrier);
+
+        let r = thread::spawn(move || b.wait())
+            .join()
+            .expect("waiter panicked");
+
+        match r {
+            BarrierResult::TimedOut { elapsed_ms } => {
+                assert!(
+                    elapsed_ms >= 150,
+                    "elapsed_ms {elapsed_ms} should be at least 150 (deadline 200)"
+                );
+            }
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        assert!(barrier.timed_out());
+        assert!(barrier.timeout_elapsed_ms() >= 150);
+    }
+
+    /// Targets L195 + the Poisoned arm of `poisoned_or_timed_out_result`
+    /// (L281, the `timed_out == false` branch of L272). Thread A
+    /// poisons before thread B even calls `wait()`; B's first load of
+    /// `self.poisoned` short-circuits to Poisoned without ever touching
+    /// count or generation atomics.
+    #[test]
+    fn poisoned_on_entry_via_separate_thread() {
+        let barrier = Arc::new(SpinBarrier::new(2));
+        let b_poisoner = Arc::clone(&barrier);
+
+        // Thread A: poison and exit. Joining A guarantees the poison
+        // store has happened-before the subsequent wait() call below
+        // (join is a synchronisation point).
+        thread::spawn(move || {
+            b_poisoner.poison();
+        })
+        .join()
+        .expect("poisoner panicked");
+
+        // Thread B (this thread): wait should observe poison at L195.
+        let r = barrier.wait();
+        assert_eq!(r, BarrierResult::Poisoned);
+        assert!(!barrier.timed_out());
+    }
+
+    /// Targets L222: poisoned check inside the spin loop. 2-party
+    /// barrier; one waiter parks-then-spins via the count fetch_add,
+    /// then the main thread poisons while the spawned thread is still
+    /// inside the spin window. To ensure the spawned thread is in the
+    /// spin loop (not in the entry guard), gate its arrival on a
+    /// counter the main thread reads before poisoning.
+    #[test]
+    fn poisoned_during_spin_loop() {
+        let barrier = Arc::new(SpinBarrier::new(2));
+        let entered = Arc::new(AtomicU32::new(0));
+
+        let b = Arc::clone(&barrier);
+        let e = Arc::clone(&entered);
+        let h = thread::spawn(move || {
+            e.store(1, SeqCst);
+            b.wait()
+        });
+
+        // Wait until the spawned thread has at least signalled it's
+        // about to enter wait(). It will be in either the spin loop
+        // or the park path; both observe poison correctly.
+        while entered.load(SeqCst) == 0 {
+            thread::sleep(Duration::from_micros(10));
+        }
+        // Tiny extra delay so the spawned thread is past the entry
+        // guard (L195) and into the count-fetch_add then the spin
+        // loop.
+        thread::sleep(Duration::from_millis(1));
+        barrier.poison();
+
+        let r = h.join().expect("waiter panicked");
+        assert_eq!(r, BarrierResult::Poisoned);
+        assert!(!barrier.timed_out());
+    }
+
+    /// Targets L249: poisoned check inside the park-loop top
+    /// predicate. Drive the spawned waiter past its ~10 μs spin
+    /// budget by sleeping the main thread for 50 ms before poisoning.
+    /// The waiter is guaranteed to be parked on `park_cv.wait_timeout`;
+    /// the broadcast wakes it and the L249 check returns true.
+    #[test]
+    fn poisoned_during_condvar_sleep() {
+        // Long deadline so the watchdog cannot fire first.
+        let barrier = Arc::new(SpinBarrier::with_deadline(2, Duration::from_secs(30)));
+        let b = Arc::clone(&barrier);
+        let h = thread::spawn(move || b.wait());
+
+        // 50 ms >> SPIN_BUDGET (~10 μs), so the spawned waiter is
+        // definitely parked on the condvar by the time we poison.
+        thread::sleep(Duration::from_millis(50));
+        barrier.poison();
+
+        let r = h.join().expect("waiter panicked");
+        assert_eq!(r, BarrierResult::Poisoned);
+        assert!(!barrier.timed_out());
+    }
+
+    /// Targets L272 + L274 together: `poisoned_or_timed_out_result`
+    /// must return `TimedOut` (not `Poisoned`) when `timed_out == true`,
+    /// and the `recorded != 0` arm of L274 must be exercised on
+    /// re-entry after the first waiter has written
+    /// `timeout_elapsed_ms`. Step 1 trips the watchdog (records
+    /// elapsed_ms != 0 and flips timed_out). Step 2 calls wait()
+    /// again: the entry guard at L195 sees poisoned=true, dispatches
+    /// to `poisoned_or_timed_out_result`, which now takes the
+    /// `timed_out=true` branch (L272) AND the `recorded != 0` branch
+    /// (L274) because the first call already wrote a non-zero
+    /// elapsed_ms.
+    #[test]
+    fn poisoned_or_timed_out_result_distinguishes_variants() {
+        // First, trip the watchdog on a fresh barrier — this
+        // exercises the trip_watchdog path and the TimedOut arm of
+        // poisoned_or_timed_out_result on subsequent waiters.
+        const DEADLINE: Duration = Duration::from_millis(50);
+        let timed_out_barrier = SpinBarrier::with_deadline(2, DEADLINE);
+        let r1 = timed_out_barrier.wait();
+        // First waiter directly returns from trip_watchdog with the
+        // computed elapsed_ms.
+        let first_elapsed = match r1 {
+            BarrierResult::TimedOut { elapsed_ms } => elapsed_ms,
+            other => panic!("expected TimedOut on first wait, got {other:?}"),
+        };
+        assert!(timed_out_barrier.timed_out());
+        // Step 2: re-entry. L195 sees poisoned, dispatches to
+        // poisoned_or_timed_out_result. timed_out=true → L272 true
+        // branch. timeout_elapsed_ms != 0 → L274 true branch.
+        let r2 = timed_out_barrier.wait();
+        match r2 {
+            BarrierResult::TimedOut { elapsed_ms } => {
+                // The recorded value is what the first trip wrote;
+                // a re-entry should report >= the original (it reads
+                // the recorded ms exactly, not the calling thread's
+                // own elapsed time).
+                assert_eq!(
+                    elapsed_ms, first_elapsed,
+                    "re-entry should surface the recorded watchdog elapsed_ms"
+                );
+            }
+            other => panic!("expected TimedOut on re-entry, got {other:?}"),
+        }
+
+        // Now exercise the Poisoned arm of L272 (timed_out == false)
+        // on a fresh barrier that is poisoned without the watchdog
+        // ever firing.
+        let poison_only_barrier = SpinBarrier::new(2);
+        poison_only_barrier.poison();
+        assert!(!poison_only_barrier.timed_out());
+        let r3 = poison_only_barrier.wait();
+        assert_eq!(r3, BarrierResult::Poisoned);
+        // Direct check: timeout_elapsed_ms() returns 0 when the
+        // watchdog never fired, distinguishing this case from the
+        // recorded-elapsed path above.
+        assert_eq!(poison_only_barrier.timeout_elapsed_ms(), 0);
+    }
+
     /// Coverage: the asymmetric variant where the lone-arriver hits the
     /// `n == parties` last-arrival path (L200 true branch) on a
     /// 2-party barrier *without* any concurrent threads — purely

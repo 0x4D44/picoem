@@ -24362,6 +24362,376 @@ mod stage2_exceptions_corecasecoverage {
         assert_eq!(cpu.decode_cache_get(cur_slot).tag, u32::MAX);
         assert_eq!(cpu.decode_cache_get(prev_slot).tag, u32::MAX);
     }
+
+    // -----------------------------------------------------------------
+    // exceptions.rs §execution_priority — active-exception fold false
+    // branch (line 554). When the active exception's priority is
+    // numerically GREATER than the masked-running priority, the fold
+    // `if exc_prio < prio` must be false and `prio` stays unchanged.
+    // Existing tests cover the true branch (exc_prio < prio sets prio).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn execution_priority_active_exception_does_not_widen() {
+        let mut cpu = CortexM33::for_test(0);
+        // PRIMASK clamps to 0, then the active-exception fold runs.
+        // Place the core in PendSV (exc 14) with SHPR set to 0x80
+        // (numerically > PRIMASK's 0). The fold must NOT replace prio,
+        // i.e. `0x80 < 0` is FALSE → false branch covered.
+        cpu.regs.primask = 1;
+        cpu.ppb.shpr[14 - 4] = 0x80;
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
+        let prio = cpu.execution_priority();
+        // PRIMASK still wins; the active exception did not widen further.
+        assert_eq!(
+            prio, 0,
+            "PRIMASK clamps to 0; PendSV at 0x80 must not widen prio above 0"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // exceptions.rs §execute_tt — MPU bounds false branch (line 780).
+    // Programmed region's `addr >= base` is true but `addr <= limit`
+    // is false — MRVALID stays clear, R/RW fall back to the SAU-on
+    // universal grant. Pins the `addr <= limit` false leg.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tt_mpu_address_above_region_limit_does_not_match() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.ppb.mpu_ctrl = 1;
+        // Region 3: covers 0x2000_0000..0x2000_03FF (RBAR aligns to /32,
+        // RLAR limit pre-encoded as `(limit & !0x1F) | 0x1F`).
+        cpu.ppb.mpu_regions[3] = (0x2000_0000, (0x2000_03E0) | 1);
+        // SAU enabled with a catch-all so the SAU-off shortcut doesn't
+        // mask the MPU's "no match" decision.
+        cpu.ppb.sau_ctrl = 1;
+        cpu.ppb.sau_regions[0] = (0x0000_0000, 0xFFFF_FFE1);
+        // Address well above the region limit.
+        let r = cpu.execute_tt(0x2000_8000);
+        assert_eq!(r & (1 << 16), 0, "MRVALID must be clear for above-limit addr");
+        assert_eq!(r & 0xFF, 0, "MREGION must default to 0 (no match)");
+    }
+
+    // -----------------------------------------------------------------
+    // exceptions.rs §execute_tt — MPU AP=01 RW grant (line 794 right
+    // arm). AP[2:1]=01 means "any read-write": both R and RW must be
+    // set. Existing tests cover AP=00 (priv RW) and AP=10 (priv RO);
+    // this pins AP=01 specifically so the `ap == 1` arm of the OR has
+    // a covering case (without it, `ap == 1` is short-circuit-dead
+    // when `ap == 0` is false).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tt_mpu_ap_any_rw_grants_rw() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.ppb.mpu_ctrl = 1;
+        // Region 4, AP=01 (any RW). RBAR encodes AP in bits [2:1].
+        let rbar = (0x2000_0000 & !0x1F) | (1 << 1); // AP=01
+        let rlar = (0x2000_0FE0) | 1; // EN=1
+        cpu.ppb.mpu_regions[4] = (rbar, rlar);
+        cpu.ppb.sau_ctrl = 1;
+        cpu.ppb.sau_regions[0] = (0x0000_0000, 0xFFFF_FFE1);
+        let r = cpu.execute_tt(0x2000_0080);
+        assert_ne!(r & (1 << 16), 0, "MRVALID set");
+        assert_ne!(r & (1 << 18), 0, "R set");
+        assert_ne!(
+            r & (1 << 19),
+            0,
+            "RW set for AP=01 (the second arm of `ap == 0 || ap == 1`)"
+        );
+        assert_eq!(r & 0xFF, 4, "MREGION = 4");
+    }
+
+    // -----------------------------------------------------------------
+    // exceptions.rs §execute_tt — MPU AP=11 (any RO) blocks RW.
+    // Symmetric to the AP=10 case but covers the bottom of the range.
+    // The two-bit AP field has 4 possible values; AP=00, 01 grant RW,
+    // AP=10, 11 deny RW — this completes the AP truth table.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tt_mpu_ap_any_ro_denies_rw() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.ppb.mpu_ctrl = 1;
+        // Region 6, AP=11 (any RO). bits[2:1] = 0b11 → (3 << 1).
+        let rbar = (0x2000_0000 & !0x1F) | (3 << 1);
+        let rlar = (0x2000_0FE0) | 1;
+        cpu.ppb.mpu_regions[6] = (rbar, rlar);
+        cpu.ppb.sau_ctrl = 1;
+        cpu.ppb.sau_regions[0] = (0x0000_0000, 0xFFFF_FFE1);
+        let r = cpu.execute_tt(0x2000_0200);
+        assert_ne!(r & (1 << 16), 0, "MRVALID set for matching region");
+        assert_ne!(r & (1 << 18), 0, "R set even for RO");
+        assert_eq!(
+            r & (1 << 19),
+            0,
+            "RW must be CLEAR for AP=11 (any RO) — both OR arms false"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // exceptions.rs §execute_tt — SAU enabled with multiple regions but
+    // address misses ALL of them; the unmatched fallback (line 838-845)
+    // applies. This pins the `addr >= base && addr <= limit` false
+    // branch through the loop body for an enabled region (line 825).
+    // Distinct from `tt_sau_unmatched_*` which use no enabled regions.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tt_sau_enabled_region_misses_address_falls_to_default() {
+        let mut cpu = CortexM33::for_test(0);
+        // SAU on, ALLNS=0 → unmatched falls to S.
+        cpu.ppb.sau_ctrl = 1;
+        // Region 0 covers 0x5000_0000..0x5000_FFE0, NSC=0, EN=1.
+        cpu.ppb.sau_regions[0] = (0x5000_0000, 0x5000_FFE0 | 1);
+        // Address well outside region 0 → loop iteration evaluates
+        // `addr >= base && addr <= limit`; both fail.
+        let r = cpu.execute_tt(0x6000_0000);
+        // Unmatched, ALLNS=0 → S bit set, no SRVALID.
+        assert_eq!(r & (1 << 17), 0, "SRVALID must be clear");
+        assert_ne!(r & (1 << 22), 0, "S fallback");
+    }
+
+    // -----------------------------------------------------------------
+    // exceptions.rs §pick_tail_chain_target — IRQ doesn't displace
+    // already-best PendSV when IRQ is at lower priority (line 444 col 35
+    // false leg). Existing test pins the WIN case for the IRQ; this
+    // pins the LOSS case so the `prio < bp` guard's false branch is
+    // exercised in pick_tail_chain_target.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tail_chain_lower_priority_irq_does_not_displace_pendsv() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.msp = 0x2000_0F00;
+        cpu.regs.r[13] = cpu.regs.msp;
+        bus.write32(cpu.regs.msp + 24, HANDLER_ADDR, 0);
+        bus.write32(cpu.regs.msp + 28, 1 << 24, 0);
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
+        // PendSV at high priority (numerically 0); IRQ 0 demoted.
+        cpu.ppb.shpr[14 - 4] = 0x00;
+        // IPR0 lane 0 = 0x80 → IRQ 0 priority numerically WORSE than PendSV.
+        cpu.ppb.nvic_ipr[0] = 0x80;
+        cpu.ppb.icsr |= crate::bus::ppb::ICSR_PENDSVSET;
+        cpu.ppb.nvic_iser[0].store(1, Ordering::Relaxed);
+        cpu.ppb.nvic_ispr[0].store(1, Ordering::Relaxed);
+        let exc_return = 0xFFFF_FFF1u32;
+        let _ = cpu.exit_exception(exc_return, &mut bus);
+        // PendSV (exc 14) wins, not the demoted IRQ 0 (exc 16).
+        assert_eq!(
+            cpu.regs.ipsr(),
+            14,
+            "PendSV must win — lower-priority IRQ must not displace it"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // EXC_RETURN cookie variants — pin every Thread/Process/Handler ×
+    // MSP/PSP × FType combination the M33 path actually decodes. The
+    // architecture defines 6 distinct cookies in the 0xFFFF_FFEx /
+    // 0xFFFF_FFFx range; the bit-4 (FType) and bit-2 (return-to-PSP)
+    // fields are the only ones our exit_exception inspects.
+    //
+    //   0xFFFF_FFE1 — FType=0 (FP), Handler/MSP   (covered above)
+    //   0xFFFF_FFE9 — FType=0 (FP), Thread/MSP    (INVPC test above)
+    //   0xFFFF_FFED — FType=0 (FP), Thread/PSP    (NEW)
+    //   0xFFFF_FFF1 — FType=1     , Handler/MSP  (covered above)
+    //   0xFFFF_FFF9 — FType=1     , Thread/MSP   (covered above)
+    //   0xFFFF_FFFD — FType=1     , Thread/PSP   (covered above)
+    //
+    // The NEW case (Thread/PSP with FP frame) exercises:
+    //   * `had_fp_frame=true` AND `return_to_psp=true` together
+    //   * line 380: `if return_to_psp { psp += frame_size }`
+    //   * line 388: `control = (...) | 2` AND `control |= FPCA`
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn exit_thread_psp_with_fp_frame_advances_psp_and_sets_fpca() {
+        let (mut cpu, mut bus) = core_bus();
+        // Set up a complete FP-frame stack on PSP at a known address.
+        cpu.regs.psp = 0x2000_0E00;
+        cpu.regs.msp = 0x2000_1000;
+        cpu.regs.r[13] = cpu.regs.msp; // currently in handler on MSP
+        // Basic frame zeros + PC to handler + xPSR with Thumb only
+        // (IPSR=0 in stacked xPSR → return-to-thread).
+        for i in 0..8 {
+            bus.write32(cpu.regs.psp + i * 4, 0, 0);
+        }
+        bus.write32(cpu.regs.psp + 24, HANDLER_ADDR, 0);
+        bus.write32(cpu.regs.psp + 28, 1 << 24, 0);
+        // FP region at psp+32 — write a known S0 bit pattern.
+        let fp_sp = cpu.regs.psp + 32;
+        let known = 7.5f32.to_bits();
+        for i in 0..16 {
+            bus.write32(fp_sp + i * 4, known.wrapping_add(i), 0);
+        }
+        bus.write32(fp_sp + 64, 0, 0); // FPSCR
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14; // currently PendSV
+        cpu.ppb.fpccr = 0; // LSPACT=0 → eager pop branch
+        cpu.ppb.fpcar = fp_sp;
+        // 0xFFFF_FFED: FType=0 (FP frame) + return-to-PSP + Thread.
+        let exc_return = 0xFFFF_FFEDu32;
+        let cycles = cpu.exit_exception(exc_return, &mut bus);
+        assert_eq!(cycles, 12, "ordinary unstack, no tail chain");
+        // PSP advanced by basic frame (32) + FP region (72) = 104.
+        assert_eq!(cpu.regs.psp, 0x2000_0E00 + 104);
+        // SPSEL=1 (CONTROL bit 1).
+        assert_ne!(cpu.regs.control & 2, 0, "SPSEL=1 (PSP)");
+        // FPCA set (FP-active thread state resumed).
+        assert_ne!(cpu.regs.control & (1 << 2), 0, "FPCA set");
+        // S0 restored from the first FP-region slot.
+        assert_eq!(cpu.regs.s[0].to_bits(), known);
+        // Returned to thread mode (IPSR = 0 from stacked xPSR).
+        assert_eq!(cpu.regs.ipsr(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // exceptions.rs §exit_exception — control bit clears for FType=1.
+    // Mirror of the eager-pop test, but FType=1 path: had_fp_frame=false
+    // must clear CONTROL.FPCA. Pins line 392's negative branch (the
+    // `had_fp_frame` true side already covered).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn exit_no_fp_frame_clears_fpca() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.msp = 0x2000_0F00;
+        cpu.regs.r[13] = cpu.regs.msp;
+        for i in 0..8 {
+            bus.write32(cpu.regs.msp + i * 4, 0, 0);
+        }
+        bus.write32(cpu.regs.msp + 24, HANDLER_ADDR, 0);
+        bus.write32(cpu.regs.msp + 28, 1 << 24, 0);
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
+        // Pre-set FPCA so the exit must explicitly clear it.
+        cpu.regs.control |= 1 << 2;
+        cpu.ppb.fpccr = 0;
+        cpu.ppb.fpcar = 0;
+        // FType=1, Thread/MSP.
+        let exc_return = 0xFFFF_FFF9u32;
+        let _ = cpu.exit_exception(exc_return, &mut bus);
+        assert_eq!(
+            cpu.regs.control & (1 << 2),
+            0,
+            "FPCA must be cleared for FType=1 EXC_RETURN"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // exceptions.rs §pick_tail_chain_target — both PendSV AND PendST
+    // pending while exiting a third handler. PendSV at default priority
+    // wins the tie-break (lower exc_num). Pins the path through the
+    // pendst arm where best is already set; cycle cost stays at 6.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tail_chain_pendsv_and_pendst_pending_pendsv_wins() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.msp = 0x2000_0F00;
+        cpu.regs.r[13] = cpu.regs.msp;
+        for i in 0..8 {
+            bus.write32(cpu.regs.msp + i * 4, 0, 0);
+        }
+        bus.write32(cpu.regs.msp + 24, HANDLER_ADDR, 0);
+        bus.write32(cpu.regs.msp + 28, 1 << 24, 0);
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 16; // ext IRQ 0 active
+        cpu.ppb.icsr |=
+            crate::bus::ppb::ICSR_PENDSVSET | crate::bus::ppb::ICSR_PENDSTSET;
+        let exc_return = 0xFFFF_FFF1u32;
+        let cycles = cpu.exit_exception(exc_return, &mut bus);
+        assert_eq!(cycles, 6, "tail-chain cost (= 6) when a candidate fires");
+        assert_eq!(
+            cpu.regs.ipsr(),
+            14,
+            "PendSV (14) wins tie over SysTick (15) by lower exc_num"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // ARMv8-M §B3.4.2 — priority preemption while inside a handler.
+    // While IPSR points at a low-priority handler, an enabled+pending
+    // higher-priority IRQ must preempt at the next step boundary. Pins
+    // the can_preempt branch where IPSR > 0 but the new IRQ's prio is
+    // numerically lower than the active handler's prio.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn higher_priority_irq_preempts_low_priority_handler() {
+        let (mut cpu, mut bus) = core_bus();
+        // Place core in PendSV (exc 14) at LOW numeric priority 0xC0.
+        cpu.ppb.shpr[14 - 4] = 0xC0;
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
+        // IRQ 1 at priority 0x40 (much higher than PendSV's 0xC0).
+        cpu.ppb.nvic_ipr[0] = 0x40 << 8; // lane 1 = IRQ 1
+        cpu.ppb.nvic_iser[0].store(0x2, Ordering::Relaxed);
+        cpu.ppb.nvic_ispr[0].store(0x2, Ordering::Relaxed);
+        let result = cpu.try_take_any_pending_exception(&mut bus);
+        assert!(result.is_some(), "preemption must occur");
+        assert_eq!(
+            cpu.regs.ipsr(),
+            17,
+            "IRQ 1 (exc 17) must preempt the active PendSV"
+        );
+    }
+
+    /// Same but the IRQ priority is NUMERICALLY EQUAL to the active
+    /// handler — preemption must NOT happen (only strictly-lower
+    /// numeric prio preempts per `can_preempt`'s `<` test). Pins the
+    /// `<` (not `<=`) discriminator on the active-exception path.
+    #[test]
+    fn equal_priority_irq_does_not_preempt_active_handler() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.ppb.shpr[14 - 4] = 0x80;
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
+        // IRQ 0 at priority 0x80 → equal to PendSV. Should NOT preempt.
+        cpu.ppb.nvic_ipr[0] = 0x80;
+        cpu.ppb.nvic_iser[0].store(1, Ordering::Relaxed);
+        cpu.ppb.nvic_ispr[0].store(1, Ordering::Relaxed);
+        let result = cpu.try_take_any_pending_exception(&mut bus);
+        assert!(result.is_none(), "equal priority must not preempt");
+        assert_eq!(cpu.regs.ipsr(), 14, "still in PendSV");
+    }
+
+    // -----------------------------------------------------------------
+    // Lazy-FP integrity exit — FType=0 with non-zero FPCAR but LSPACT=0
+    // is OK (Phase 7 pseudo-code: the lazy reservation may have been
+    // resolved by an in-handler FP op that flushed and cleared LSPACT,
+    // and the eager-pop path reads from FPCAR). Pins the second leg of
+    // the integrity check at line 285 — `!lspact && fpcar==0` is the
+    // bogus case; `!lspact && fpcar!=0` must be fine.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn exit_fp_frame_lspact_clear_fpcar_set_is_ok() {
+        let (mut cpu, mut bus) = core_bus();
+        cpu.regs.msp = 0x2000_0E00;
+        cpu.regs.r[13] = cpu.regs.msp;
+        // Basic frame.
+        for i in 0..8 {
+            bus.write32(cpu.regs.msp + i * 4, 0, 0);
+        }
+        bus.write32(cpu.regs.msp + 24, HANDLER_ADDR, 0);
+        bus.write32(cpu.regs.msp + 28, 1 << 24, 0);
+        // FP region populated.
+        let fp_sp = cpu.regs.msp + 32;
+        for i in 0..16 {
+            bus.write32(fp_sp + i * 4, 0, 0);
+        }
+        bus.write32(fp_sp + 64, 0, 0);
+        cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
+        // LSPACT=0 + FPCAR != 0 → handler-flushed lazy reservation; OK.
+        cpu.ppb.fpccr = 0;
+        cpu.ppb.fpcar = fp_sp;
+        // FType=0 — must NOT raise INVPC.
+        let exc_return = 0xFFFF_FFE1u32;
+        let cycles = cpu.exit_exception(exc_return, &mut bus);
+        assert!(cycles > 0, "exit must succeed");
+        assert!(cpu.pending_fault.is_none(), "no INVPC raised");
+        // Confirm the integrity check went through to the eager-pop path
+        // (CFSR.UFSR.INVPC bit 17 must NOT be set).
+        assert_eq!(cpu.ppb.cfsr & (1 << 17), 0, "INVPC bit clear");
+    }
 }
 
 // ============================================================================
@@ -28820,5 +29190,770 @@ mod stage3_dma_residue {
                 assert_eq!(r & CTRL_BUSY, 0, "ch{} must be idle", ch);
             }
         }
+    }
+}
+
+// ============================================================================
+// core/mod.rs branch-coverage targeted tests
+// ============================================================================
+//
+// Targets the small set of branches in `crates/rp2350-emu/src/core/mod.rs`
+// not already exercised by the broader `stage7_core_mod_coverage` and IT-block
+// suites. Each test is documented with the specific branch arm it targets so
+// future maintainers can keep the coverage signal vs. test cost tight.
+
+mod core_mod_branches {
+    use crate::bus::Bus;
+    use crate::core::{CortexM33, Fault, PerCoreSio};
+    use crate::threaded::CoreAtomics;
+    use std::sync::Arc;
+
+    /// Helper: fresh CPU + Bus sharing one CoreAtomics (matches the
+    /// pattern used throughout `tests.rs::core_and_bus`).
+    fn make_env() -> (CortexM33, Bus) {
+        let atomics = Arc::new(CoreAtomics::default());
+        let cpu = CortexM33::new(0, Arc::clone(&atomics));
+        let bus = Bus::with_atomics(atomics);
+        (cpu, bus)
+    }
+
+    // -------------------------------------------------------------------
+    // PerCoreSio div CSR (offset 0x078): bit 1 (DIRTY) tracking
+    // -------------------------------------------------------------------
+
+    /// CSR readback at 0x078 with a fresh (clean) divider — DIRTY=0.
+    /// Targets the `else` arm of the dirty-bit conditional in
+    /// `PerCoreSio::read32` for the 0x078 CSR.
+    #[test]
+    fn percoresio_csr_clean_dirty_bit_zero() {
+        let mut s = PerCoreSio::default();
+        // No write yet → dirty=false. CSR low bits: READY=1, DIRTY=0.
+        let csr = s.read32(0x078);
+        assert_eq!(csr & 0x3, 0x1, "READY=1, DIRTY=0 on a fresh divider");
+    }
+
+    /// CSR readback at 0x078 immediately after a divide — DIRTY=1.
+    /// Pairs with the test above to lock the true branch.
+    #[test]
+    fn percoresio_csr_dirty_bit_set_after_compute() {
+        let mut s = PerCoreSio::default();
+        s.write32(0x060, 100);
+        s.write32(0x064, 7);
+        // DIRTY (bit 1) must be set, and READY (bit 0) is always 1.
+        let csr = s.read32(0x078);
+        assert_eq!(csr & 0x3, 0x3, "READY=1, DIRTY=1 right after a divide");
+    }
+
+    /// `divider_result_read` increments `reads_pending` exactly once on the
+    /// first read, then clears DIRTY on the second. Targets:
+    ///   line 107 — `if d.dirty { ... }` true arm
+    ///   line 109 — `if d.reads_pending >= 2 { ... }` true arm.
+    #[test]
+    fn percoresio_dirty_clears_only_after_two_reads() {
+        let mut s = PerCoreSio::default();
+        s.write32(0x060, 42);
+        s.write32(0x064, 6); // 42 / 6 = 7
+        // First read: returns the value and increments reads_pending; DIRTY
+        // remains set (line 107 hit, line 109 false).
+        assert_eq!(s.read32(0x070), 7);
+        assert_eq!(s.read32(0x078) & 0x2, 0x2, "DIRTY still set after one read");
+        // Second read: line 109 true → clears DIRTY.
+        assert_eq!(s.read32(0x074), 0);
+        assert_eq!(s.read32(0x078) & 0x2, 0x0, "DIRTY cleared after second read");
+    }
+
+    /// `divider_result_read` on a non-dirty divider does NOT increment
+    /// `reads_pending` — targets the false arm of line 107
+    /// (`if d.dirty`).
+    #[test]
+    fn percoresio_dirty_false_arm_no_increment() {
+        let mut s = PerCoreSio::default();
+        // Direct write to QUOTIENT then immediately drain the dirty flag
+        // by reading both halves. Now further reads stay non-dirty.
+        s.write32(0x070, 0x1234);
+        let _ = s.read32(0x070); // first read while dirty
+        let _ = s.read32(0x074); // second read clears dirty
+        // Subsequent reads must not panic and must keep DIRTY clear (the
+        // dirty=false branch on line 107).
+        let _ = s.read32(0x070);
+        assert_eq!(s.read32(0x078) & 0x2, 0x0);
+    }
+
+    // -------------------------------------------------------------------
+    // PerCoreSio compute_division: divisor==0 / signed / unsigned arms
+    // -------------------------------------------------------------------
+
+    /// Targets line 159 (`if d.divisor == 0`) true arm via the unsigned
+    /// path → quotient = 0xFFFF_FFFF; the signed=false branch is taken.
+    #[test]
+    fn compute_division_unsigned_div_by_zero() {
+        let mut s = PerCoreSio::default();
+        s.write32(0x060, 0xCAFE); // unsigned dividend
+        s.write32(0x064, 0); // divisor = 0 — triggers unsigned compute
+        assert_eq!(s.read32(0x070), 0xFFFF_FFFF);
+        assert_eq!(s.read32(0x074), 0xCAFE);
+    }
+
+    /// Targets line 161 (`if d.signed`) true arm + line 163 inner ternary
+    /// for negative dividend.
+    #[test]
+    fn compute_division_signed_div_by_zero_negative_dividend() {
+        let mut s = PerCoreSio::default();
+        s.write32(0x068, (-7i32) as u32); // signed dividend, negative
+        s.write32(0x06C, 0); // divisor = 0 — triggers signed compute
+        // negative dividend / 0 → quotient = 1 (per RP2350 silicon).
+        assert_eq!(s.read32(0x070), 1);
+        assert_eq!(s.read32(0x074) as i32, -7);
+    }
+
+    /// Targets line 163 ternary FALSE arm (positive dividend) for signed
+    /// div-by-zero.
+    #[test]
+    fn compute_division_signed_div_by_zero_positive_dividend() {
+        let mut s = PerCoreSio::default();
+        s.write32(0x068, 5);
+        s.write32(0x06C, 0);
+        // positive dividend / 0 → quotient = -1.
+        assert_eq!(s.read32(0x070) as i32, -1);
+        assert_eq!(s.read32(0x074), 5);
+    }
+
+    /// Targets line 172 (`} else if d.signed`) — non-zero divisor, signed
+    /// path with negative dividend (covers wrapping_div / wrapping_rem).
+    #[test]
+    fn compute_division_signed_nonzero_negative() {
+        let mut s = PerCoreSio::default();
+        s.write32(0x068, (-100i32) as u32);
+        s.write32(0x06C, (-7i32) as u32);
+        // -100 / -7 = 14 remainder -100 - (14*-7) = -100+98 = -2.
+        assert_eq!(s.read32(0x070), 14);
+        assert_eq!(s.read32(0x074) as i32, -2);
+    }
+
+    // -------------------------------------------------------------------
+    // advance_it_state — multi-instruction IT block (mid-block advance)
+    // -------------------------------------------------------------------
+
+    /// ITTT EQ — three Then conditions. After executing the first
+    /// instruction inside the block, `it_state & 0x7 != 0`, so the
+    /// `else` arm of `advance_it_state` runs (line 1064). Pairs with
+    /// `it_eq_taken` (which only exercises the last-instruction arm).
+    #[test]
+    fn advance_it_state_mid_block_takes_else_arm() {
+        let atomics = Arc::new(CoreAtomics::default());
+        let mut c = CortexM33::new(0, Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(atomics);
+        let base = 0x2000_0000u32;
+        // ITTT EQ: firstcond=0000, mask=0010 (3 Then ops, no Else) = 0xBF02.
+        bus.write16(base, 0xBF02, 0);
+        bus.write16(base + 2, 0x2001, 0); // MOVS R0, #1
+        bus.write16(base + 4, 0x2102, 0); // MOVS R1, #2
+        bus.write16(base + 6, 0x2203, 0); // MOVS R2, #3
+        c.regs.set_pc(base);
+        c.regs.set_flag_z(true); // EQ true
+        c.step(&mut bus); // IT
+        // After IT: it_state = 0x02. (cond=0, mask=0010)
+        assert_eq!(c.it_state(), 0x02);
+        c.step(&mut bus); // MOVS R0 — first body inst, mid-block advance
+        // After advance: it_state = (0x02 & 0xE0) | ((0x02 << 1) & 0x1F) = 0x04.
+        assert_eq!(c.it_state(), 0x04, "advance_it_state ELSE arm reached");
+        c.step(&mut bus); // MOVS R1 — still mid-block
+        assert_eq!(c.it_state(), 0x08, "still mid-block");
+        c.step(&mut bus); // MOVS R2 — last body inst, IF arm
+        assert_eq!(c.it_state(), 0, "block cleared on last instruction");
+        assert_eq!(c.reg(0), 1);
+        assert_eq!(c.reg(1), 2);
+        assert_eq!(c.reg(2), 3);
+    }
+
+    // -------------------------------------------------------------------
+    // bus_read16 / bus_write16 / bus_write8 — PPB region with mmio trace
+    // -------------------------------------------------------------------
+
+    /// Halfword read of a PPB register with `mmio_trace_enabled = true`
+    /// drives line 850 + the `addr & 2 != 0` true arm at line 845. Pair
+    /// with the offset=0 case to lock both halves of the ternary.
+    #[test]
+    fn bus_read16_ppb_with_trace_low_and_high_halves() {
+        let (mut cpu, mut bus) = make_env();
+        bus.mmio_trace_enabled = true;
+        let sink = Vec::<u8>::new();
+        bus.set_mmio_trace_sink(Some(Box::new(sink)));
+        // Seed VTOR (a R/W PPB register at 0xE000_ED08).
+        cpu.bus_write32(0xE000_ED08, 0xABCD_1234, &mut bus);
+        // Low half (addr & 2 == 0) → 0x1200 because VTOR low bits are
+        // forced to zero on write per PPB rules.
+        let lo = cpu.bus_read16(0xE000_ED08, &mut bus);
+        // High half (addr & 2 != 0) → 0xABCD.
+        let hi = cpu.bus_read16(0xE000_ED0A, &mut bus);
+        // Combined value = original high (0xABCD), low PPB-masked to 0x1200.
+        assert_eq!(((hi as u32) << 16) | lo as u32, 0xABCD_1200);
+        bus.mmio_trace_enabled = false;
+        bus.set_mmio_trace_sink(None);
+    }
+
+    /// Halfword write of a PPB register with both halves and trace on:
+    /// drives the `addr & 2 != 0` true/false split at line 882 plus the
+    /// trace-emit line 889.
+    #[test]
+    fn bus_write16_ppb_with_trace_both_halves() {
+        let (mut cpu, mut bus) = make_env();
+        bus.mmio_trace_enabled = true;
+        let sink = Vec::<u8>::new();
+        bus.set_mmio_trace_sink(Some(Box::new(sink)));
+        // Use VTOR (0xE000_ED08): write low half then high half, then
+        // confirm via wide read.
+        cpu.bus_write16(0xE000_ED08, 0x4000, &mut bus); // low (forced-zero in low bits)
+        cpu.bus_write16(0xE000_ED0A, 0x2000, &mut bus); // high
+        let after = cpu.bus_read32(0xE000_ED08, &mut bus);
+        // VTOR honours bits [31:7]; bit pattern depends on the register,
+        // but post-RMW it must reflect the high half we wrote.
+        assert_eq!(after & 0xFFFF_0000, 0x2000_0000);
+        bus.mmio_trace_enabled = false;
+        bus.set_mmio_trace_sink(None);
+    }
+
+    /// Byte read/write of a PPB register: read returns 0, write drops,
+    /// both with trace on. Drives line 909 (read trace) and line 934
+    /// (write trace).
+    #[test]
+    fn bus_byte_ppb_with_trace_returns_zero_and_drops() {
+        let (mut cpu, mut bus) = make_env();
+        bus.mmio_trace_enabled = true;
+        let sink = Vec::<u8>::new();
+        bus.set_mmio_trace_sink(Some(Box::new(sink)));
+        // Seed VTOR via wide write.
+        cpu.bus_write32(0xE000_ED08, 0x2000_0080, &mut bus);
+        // Byte read of any byte returns 0 by PPB rules.
+        for i in 0..4 {
+            assert_eq!(cpu.bus_read8(0xE000_ED08 + i, &mut bus), 0);
+        }
+        // Byte writes drop without changing the wide value.
+        cpu.bus_write8(0xE000_ED08, 0xFF, &mut bus);
+        cpu.bus_write8(0xE000_ED0B, 0xAA, &mut bus);
+        assert_eq!(cpu.bus_read32(0xE000_ED08, &mut bus), 0x2000_0080);
+        bus.mmio_trace_enabled = false;
+        bus.set_mmio_trace_sink(None);
+    }
+
+    /// Narrow accesses to SIO_LOCAL with trace on — drives the
+    /// `Self::is_sio_local(addr)` true arm + the trace-on subarm in
+    /// `bus_read16` (line 858, 863) and `bus_write16` (line 897) and
+    /// `bus_write8` (line 941). DIV_QUOTIENT (0xD000_0070) is the
+    /// canonical target.
+    #[test]
+    fn bus_narrow_sio_local_with_trace() {
+        let (mut cpu, mut bus) = make_env();
+        cpu.bus_write32(0xD000_0070, 0xDEAD_BEEF, &mut bus);
+        bus.mmio_trace_enabled = true;
+        let sink = Vec::<u8>::new();
+        bus.set_mmio_trace_sink(Some(Box::new(sink)));
+        // 16-bit read at offset 0 (low half) and offset 2 (high half).
+        assert_eq!(cpu.bus_read16(0xD000_0070, &mut bus), 0xBEEF);
+        assert_eq!(cpu.bus_read16(0xD000_0072, &mut bus), 0xDEAD);
+        // 8-bit reads — covers each byte lane.
+        assert_eq!(cpu.bus_read8(0xD000_0070, &mut bus), 0xEF);
+        assert_eq!(cpu.bus_read8(0xD000_0073, &mut bus), 0xDE);
+        // Narrow writes to SIO_LOCAL are silently dropped (pre-Stage-3
+        // semantics) — ensure value is preserved.
+        cpu.bus_write16(0xD000_0070, 0x0000, &mut bus);
+        cpu.bus_write8(0xD000_0070, 0x00, &mut bus);
+        assert_eq!(cpu.bus_read32(0xD000_0070, &mut bus), 0xDEAD_BEEF);
+        bus.mmio_trace_enabled = false;
+        bus.set_mmio_trace_sink(None);
+    }
+
+    // -------------------------------------------------------------------
+    // Boot-RAM carve-out: the `!Bus::is_boot_ram(addr)` guard
+    // -------------------------------------------------------------------
+
+    /// Boot-RAM at 0xEFFF_F000 is in region 0xE but is *not* PPB. The
+    /// `addr >> 28 == 0xE && !Bus::is_boot_ram(addr)` guard at line 796
+    /// (and 837/876/907/932) must take the FALSE arm and fall through
+    /// to the regular bus path. Drives the FALSE branch of the AND.
+    #[test]
+    fn bus_access_boot_ram_falls_through_to_bus() {
+        let (mut cpu, mut bus) = make_env();
+        // Boot-RAM is read-write SRAM in production; write a value
+        // through the wrapper and read it back via `bus.read32`.
+        let addr = 0xEFFF_F000u32;
+        cpu.bus_write32(addr, 0xCAFE_BABE, &mut bus);
+        assert_eq!(bus.read32(addr, 0), 0xCAFE_BABE);
+        // Narrow widths must also fall through (not get PPB-masked).
+        assert_eq!(cpu.bus_read16(addr, &mut bus), 0xBABE);
+        assert_eq!(cpu.bus_read16(addr + 2, &mut bus), 0xCAFE);
+        assert_eq!(cpu.bus_read8(addr, &mut bus), 0xBE);
+    }
+
+    // -------------------------------------------------------------------
+    // Illegal-opcode → UsageFault → step() escalates to HardFault
+    // -------------------------------------------------------------------
+
+    /// UDF (0xDE00) executed via `step()` with USGFAULTENA=0 must escalate
+    /// the synthesized UsageFault to a HardFault on the same step. This
+    /// is the full pipeline (decode → fault → escalate) and complements
+    /// `udf_raises_usage_fault` (which only checks `pending_fault`) and
+    /// `usagefault_disabled_escalates` (which sets `pending_fault`
+    /// directly). Targets the deliver_fault → enter_exception(3) escalate
+    /// chain hit from inside step().
+    #[test]
+    fn udf_step_escalates_to_hardfault_when_usgfaultena_off() {
+        let (mut cpu, mut bus) = make_env();
+        let vtor: u32 = 0x2000_4000;
+        cpu.ppb.vtor = vtor;
+        // HardFault vector (#3) → handler at 0x2000_5000 with thumb bit.
+        bus.write32(vtor + 3 * 4, 0x2000_5001, 0);
+        bus.write16(0x2000_5000, 0xE7FE, 0); // handler: B .
+        // USGFAULTENA = 0 (default) → escalate to HardFault.
+        assert_eq!(cpu.ppb.shcsr & (1 << 18), 0);
+        cpu.regs.msp = 0x2000_3000;
+        cpu.regs.r[13] = cpu.regs.msp;
+        // Place UDF #0 at PC.
+        bus.write16(0x2000_2000, 0xDE00, 0);
+        cpu.regs.set_pc(0x2000_2000);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 3, "HardFault entered");
+        assert_ne!(cpu.ppb.hfsr & (1 << 30), 0, "HFSR.FORCED set");
+        assert_ne!(cpu.ppb.cfsr & (1 << 16), 0, "UFSR.UNDEFINSTR set");
+    }
+
+    /// UDF executed via `step()` with USGFAULTENA=1 enters UsageFault
+    /// directly (#6). Locks the non-escalating path inside `step()`.
+    #[test]
+    fn udf_step_delivers_usagefault_when_enabled() {
+        let (mut cpu, mut bus) = make_env();
+        let vtor: u32 = 0x2000_4000;
+        cpu.ppb.vtor = vtor;
+        // UsageFault vector (#6).
+        bus.write32(vtor + 6 * 4, 0x2000_5001, 0);
+        bus.write16(0x2000_5000, 0xE7FE, 0);
+        cpu.ppb.shcsr |= 1 << 18; // USGFAULTENA = 1
+        cpu.regs.msp = 0x2000_3000;
+        cpu.regs.r[13] = cpu.regs.msp;
+        bus.write16(0x2000_2000, 0xDE00, 0); // UDF
+        cpu.regs.set_pc(0x2000_2000);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 6, "UsageFault entered (no escalation)");
+    }
+
+    // -------------------------------------------------------------------
+    // Secure call: SG (Secure Gateway) from non-secure
+    // -------------------------------------------------------------------
+
+    /// SG (0xE97F_E97F) executed from non-secure transitions to secure
+    /// AND clears LR bit 0. Complements `sg_in_secure_is_nop` (which
+    /// covers the secure-state NOP arm). Drives the
+    /// `transition_to_secure` path → `swap_security_banks` →
+    /// `sync_sp_{to,from}_banked` chain.
+    ///
+    /// Per the field-naming convention used by `Registers`:
+    ///   - In NS state, `regs.msp` is the *active* (NS) MSP; `regs.msp_ns`
+    ///     holds the banked *Secure* MSP that will become active after a
+    ///     transition back to S.
+    ///   - In S state, `regs.msp` is the active Secure MSP; `regs.msp_ns`
+    ///     holds the banked NS MSP.
+    /// The same convention applies to PSP/MSPLIM/PSPLIM/CONTROL etc.
+    #[test]
+    fn sg_from_nonsecure_transitions_and_clears_lr_bit0() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.secure = false;
+        cpu.regs.set_lr(0x1234_5679); // bit 0 set (Thumb-state marker)
+        // NS active MSP = 0x2000_3000; Secure-banked MSP = 0x2000_4000.
+        cpu.regs.msp = 0x2000_3000;
+        cpu.regs.msp_ns = 0x2000_4000;
+        cpu.regs.r[13] = cpu.regs.msp;
+        let cy = cpu.execute_one_wide(0xE97F, 0xE97F);
+        assert_eq!(cy, 1);
+        assert!(cpu.secure, "SG must take core to Secure state");
+        // After the swap, the active MSP must be the previously-banked
+        // Secure value (0x2000_4000), and the NS value must be banked
+        // out into msp_ns.
+        assert_eq!(cpu.regs.msp, 0x2000_4000, "Secure MSP becomes active");
+        assert_eq!(cpu.regs.msp_ns, 0x2000_3000, "NS MSP banked");
+        assert_eq!(cpu.regs.r[13], 0x2000_4000, "r[13] tracks new active MSP");
+        // LR bit 0 cleared per Armv8-M SG semantics.
+        assert_eq!(cpu.regs.lr() & 1, 0, "SG must clear LR bit 0");
+        assert_eq!(cpu.regs.lr() & !1, 0x1234_5678);
+    }
+
+    // -------------------------------------------------------------------
+    // Banked-SP sync at MSR control boundary
+    // -------------------------------------------------------------------
+
+    /// `MSR CONTROL, Rn` with SPSEL change forces `sync_sp_to_banked`
+    /// before the swap and `sync_sp_from_banked` after. The coverage
+    /// signal here is independent of `msr_control_spsel` because it
+    /// asserts the _full_ banked layout (msplim too) rather than just
+    /// MSP/PSP, and it pins a non-trivial PSPLIM/MSPLIM around the swap.
+    #[test]
+    fn msr_control_spsel_preserves_banked_limits() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.regs.msp = 0x2000_1000;
+        cpu.regs.psp = 0x2000_2000;
+        cpu.regs.msplim = 0x2000_0F00;
+        cpu.regs.psplim = 0x2000_1F00;
+        cpu.regs.r[13] = cpu.regs.msp;
+
+        // MSR CONTROL, R0 with SPSEL=1.
+        cpu.set_reg(0, 0x2);
+        cpu.execute_one_wide(0xF380, 0x8014);
+        assert_eq!(cpu.regs.r[13], 0x2000_2000, "active SP switched to PSP");
+        // MSPLIM and PSPLIM must remain in their respective banks
+        // (sync_sp_to_banked saved the active SP, swap left these alone).
+        assert_eq!(cpu.regs.msplim, 0x2000_0F00);
+        assert_eq!(cpu.regs.psplim, 0x2000_1F00);
+
+        // Move the active SP and switch back — the new active value must
+        // land in the PSP slot (sync_sp_to_banked) before SPSEL flips.
+        cpu.regs.r[13] = 0x2000_2080;
+        cpu.set_reg(0, 0x0);
+        cpu.execute_one_wide(0xF380, 0x8014);
+        assert_eq!(cpu.regs.r[13], 0x2000_1000, "back on MSP");
+        assert_eq!(cpu.regs.psp, 0x2000_2080, "PSP captured the moved value");
+        // Limits still in place.
+        assert_eq!(cpu.regs.msplim, 0x2000_0F00);
+        assert_eq!(cpu.regs.psplim, 0x2000_1F00);
+    }
+
+    // -------------------------------------------------------------------
+    // invalidate_decode_cache_regions — region-scoped sweep with hit
+    // -------------------------------------------------------------------
+
+    /// Populate the decode cache with a known SRAM-region tag, then call
+    /// `invalidate_decode_cache_regions(0x04)` (the SRAM bit). The slot
+    /// must be cleared because `nibble == 2 < 8 && regions & (1 << 2)`
+    /// matches. Drives line 667 true/true.
+    #[test]
+    fn invalidate_decode_cache_regions_clears_matching_region() {
+        use crate::bus::DecodedOp;
+        let mut cpu = CortexM33::for_test(0);
+        // Tag 0x2000_0010 → slot index ((0x2000_0010 >> 1) & MASK).
+        // Region nibble = 0x2 → SRAM bit (1<<2) = 0x04.
+        let pc = 0x2000_0010u32;
+        let slot = ((pc >> 1) as usize)
+            & (crate::bus::DECODE_CACHE_SIZE - 1);
+        let entry = DecodedOp {
+            tag: pc,
+            hw0: 0xBF00, // NOP
+            hw1: 0,
+            fetch_wait: 0,
+            flags: 0,
+        };
+        cpu.decode_cache_set(slot, entry);
+        // Sanity check: stored entry tag matches.
+        assert_eq!(cpu.decode_cache_get(slot).tag, pc);
+        // Selective invalidate of SRAM region only.
+        cpu.invalidate_decode_cache_regions(0x04);
+        // Entry must now be empty.
+        assert_eq!(
+            cpu.decode_cache_get(slot).tag,
+            DecodedOp::empty().tag,
+            "matching-region slot must be evicted"
+        );
+    }
+
+    /// Region-scoped sweep with a non-matching region bit — the populated
+    /// SRAM slot must NOT be cleared. Drives line 667 false arm.
+    #[test]
+    fn invalidate_decode_cache_regions_skips_non_matching_region() {
+        use crate::bus::DecodedOp;
+        let mut cpu = CortexM33::for_test(0);
+        let pc = 0x2000_0020u32;
+        let slot = ((pc >> 1) as usize)
+            & (crate::bus::DECODE_CACHE_SIZE - 1);
+        let entry = DecodedOp {
+            tag: pc,
+            hw0: 0xBF00,
+            hw1: 0,
+            fetch_wait: 0,
+            flags: 0,
+        };
+        cpu.decode_cache_set(slot, entry);
+        // Invalidate with the ROM-only bit (0x01) — SRAM slot stays.
+        cpu.invalidate_decode_cache_regions(0x01);
+        assert_eq!(
+            cpu.decode_cache_get(slot).tag,
+            pc,
+            "non-matching region must leave slot alone"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Fault::MemManage delivery via deliver_fault — neither MEMFAULTENA
+    // nor USGFAULTENA tested in stage7_exceptions_coverage today.
+    // -------------------------------------------------------------------
+
+    /// Set `pending_fault = MemManage` with MEMFAULTENA=0 → escalate to
+    /// HardFault. Pairs with the existing UsageFault escalation test.
+    #[test]
+    fn memmanage_disabled_escalates_to_hardfault() {
+        let (mut cpu, mut bus) = make_env();
+        let vtor: u32 = 0x2000_4000;
+        cpu.ppb.vtor = vtor;
+        bus.write32(vtor + 3 * 4, 0x2000_5001, 0);
+        bus.write16(0x2000_5000, 0xE7FE, 0);
+        cpu.regs.msp = 0x2000_3000;
+        cpu.regs.r[13] = cpu.regs.msp;
+        cpu.ppb.shcsr &= !(1 << 16); // MEMFAULTENA = 0
+        cpu.pending_fault = Some(Fault::MemManage);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 3);
+        assert_ne!(cpu.ppb.hfsr & (1 << 30), 0);
+        assert_ne!(cpu.ppb.cfsr & (1 << 1), 0, "MMFSR.DACCVIOL set");
+    }
+
+    /// MEMFAULTENA=1 → MemManage delivered directly as exception #4.
+    #[test]
+    fn memmanage_enabled_delivered_directly() {
+        let (mut cpu, mut bus) = make_env();
+        let vtor: u32 = 0x2000_4000;
+        cpu.ppb.vtor = vtor;
+        bus.write32(vtor + 4 * 4, 0x2000_5001, 0);
+        bus.write16(0x2000_5000, 0xE7FE, 0);
+        cpu.regs.msp = 0x2000_3000;
+        cpu.regs.r[13] = cpu.regs.msp;
+        cpu.ppb.shcsr |= 1 << 16;
+        cpu.pending_fault = Some(Fault::MemManage);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 4, "MemManage entered (no escalation)");
+    }
+}
+
+// ============================================================================
+// core/coprocessor.rs branch-coverage targeted tests
+// ============================================================================
+//
+// Adds focused tests for the few DCP / RCP arithmetic + dispatch arms not
+// directly hit by the existing Phase 7 Stage D/E suites or
+// `stage7_coprocessor_coverage`. Pin status-bit semantics for boundary
+// inputs (max/min, signed-edge, NaN) and additional RCP canary mismatch
+// scenarios.
+
+mod coprocessor_branches {
+    use crate::bus::Bus;
+    use crate::core::{CortexM33, Fault};
+    use crate::threaded::CoreAtomics;
+    use std::sync::Arc;
+
+    fn enable_cp(cpu: &mut CortexM33, coproc: u8) {
+        cpu.ppb.cpacr |= 0x3 << (coproc as u32 * 2);
+    }
+
+    fn make_env() -> (CortexM33, Bus) {
+        let atomics = Arc::new(CoreAtomics::default());
+        let cpu = CortexM33::new(0, Arc::clone(&atomics));
+        let bus = Bus::with_atomics(atomics);
+        (cpu, bus)
+    }
+
+    /// CDP (CP4/5) encoder mirroring `coprocessor::tests::encode_cdp_dcp`,
+    /// kept private here so this module is self-contained.
+    fn encode_cdp_dcp(opc1: u8, opc2: u8, crd: u8, crn: u8, crm: u8) -> (u16, u16) {
+        let hw0: u16 = 0xEE00 | ((opc1 as u16 & 0xF) << 4) | (crn as u16 & 0xF);
+        let hw1: u16 = ((crd as u16) << 12)
+            | (4u16 << 8)
+            | ((opc2 as u16 & 0x7) << 5)
+            | (crm as u16 & 0xF);
+        (hw0, hw1)
+    }
+
+    /// MCR2 encoder for CP7 RCP tests.
+    fn encode_mcr2(opc1: u8, opc2: u8, rt: u8, crn: u8, crm: u8) -> (u16, u16) {
+        let hw0: u16 = 0xFE00 | ((opc1 as u16 & 0x7) << 5) | (crn as u16 & 0xF);
+        let hw1: u16 =
+            ((rt as u16) << 12) | (7u16 << 8) | ((opc2 as u16 & 0x7) << 5) | 0x10 | (crm as u16 & 0xF);
+        (hw0, hw1)
+    }
+
+    // -------------------------------------------------------------------
+    // DCP arithmetic — boundary inputs that pin status-bit edges
+    // -------------------------------------------------------------------
+
+    /// dadd of f64::MAX + f64::MAX overflows to +Infinity. Status bits
+    /// must show INF=1, NEG=0, NaN=0, ZERO=0. Exercises the
+    /// dcp_set_arith_status path with `r.is_infinite() = true` and
+    /// `r.is_sign_negative() = false`.
+    #[test]
+    fn dcp_dadd_overflow_to_positive_infinity() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        cpu.dcp_set_double(0, f64::MAX);
+        cpu.dcp_set_double(1, f64::MAX);
+        let (hw0, hw1) = encode_cdp_dcp(0, 0, 2, 0, 1);
+        let cy = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cy, 4);
+        assert_eq!(cpu.dcp_get_double(2), f64::INFINITY);
+        // INF bit set, no others.
+        assert_eq!(cpu.dcp_get_status() & 0xF, 0b0100);
+    }
+
+    /// dsub of -f64::MAX - f64::MAX underflows to -Infinity. INF=1, NEG=1.
+    #[test]
+    fn dcp_dsub_underflow_to_negative_infinity() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        cpu.dcp_set_double(0, -f64::MAX);
+        cpu.dcp_set_double(1, f64::MAX);
+        let (hw0, hw1) = encode_cdp_dcp(0, 1, 2, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_double(2), f64::NEG_INFINITY);
+        assert_eq!(cpu.dcp_get_status() & 0xF, 0b0110, "INF=1 + NEG=1");
+    }
+
+    /// dmul of NaN × finite is NaN. NaN bit must set; ZERO and INF
+    /// must not. Locks the NaN status arm without going through ddiv.
+    #[test]
+    fn dcp_dmul_nan_times_finite_yields_nan_status() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        cpu.dcp_set_double(0, f64::NAN);
+        cpu.dcp_set_double(1, 3.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 2, 2, 0, 1);
+        let cy = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cy, 5, "dmul cycle cost");
+        assert!(cpu.dcp_get_double(2).is_nan());
+        let s = cpu.dcp_get_status();
+        assert_ne!(s & (1 << 3), 0, "NaN bit set");
+        assert_eq!(s & (1 << 0), 0, "ZERO bit clear");
+        assert_eq!(s & (1 << 2), 0, "INF bit clear");
+    }
+
+    /// dadd of (-3.0, 3.0) yields +0.0 — ZERO=1, NEG=0. Pairs with the
+    /// existing `test_dcp_status_negative_zero_bit` which covers ZERO+NEG.
+    #[test]
+    fn dcp_dadd_to_positive_zero_sets_zero_only() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        cpu.dcp_set_double(0, -3.0);
+        cpu.dcp_set_double(1, 3.0);
+        let (hw0, hw1) = encode_cdp_dcp(0, 0, 2, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        let r = cpu.dcp_get_double(2);
+        assert_eq!(r, 0.0);
+        assert!(!r.is_sign_negative(), "result must be +0.0");
+        assert_eq!(cpu.dcp_get_status() & 0xF, 0b0001, "ZERO only");
+    }
+
+    /// dmul of (-1.0, f64::MAX) overflows to -Infinity (INF + NEG bits).
+    #[test]
+    fn dcp_dmul_overflow_negative_infinity() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        cpu.dcp_set_double(0, -1.0);
+        cpu.dcp_set_double(1, f64::MAX);
+        // (-1) * MAX = -MAX (still finite). Use MIN_POSITIVE/MAX combo
+        // for guaranteed overflow:
+        cpu.dcp_set_double(0, -2.0);
+        cpu.dcp_set_double(1, f64::MAX);
+        let (hw0, hw1) = encode_cdp_dcp(0, 2, 2, 0, 1);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.dcp_get_double(2), f64::NEG_INFINITY);
+        assert_eq!(cpu.dcp_get_status() & 0xF, 0b0110, "INF + NEG");
+    }
+
+    // -------------------------------------------------------------------
+    // CP7 RCP — additional canary mismatch / boundary tests
+    // -------------------------------------------------------------------
+
+    /// rcp_canary_check with a NON-zero salt and Rt holding the wrong
+    /// value must raise NMI. Complements
+    /// `test_rcp_canary_check_fail_raises_nmi` which uses the bootrom
+    /// imm tag; this one uses an arbitrary salt and Rt = 0 (a common
+    /// "zero default" footgun) to lock the mismatch arm.
+    #[test]
+    fn rcp_canary_check_fail_with_zero_rt_raises_nmi() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        bus.atomics.rcp_salt_set(0, 0x1234_5678);
+        cpu.regs.r[2] = 0; // not equal to salt^0xDEADBEEF
+        let (hw0, hw1) = encode_mcr2(0, 1, 2, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    /// rcp_canary_check with salt-invalid AND Rt mismatching the
+    /// salt-zero canary still raises NMI (the salt-invalid divergence
+    /// only papers over the case where Rt happens to equal
+    /// `0 ^ 0xDEADBEEF`). Pin the genuine mismatch arm under this
+    /// edge-case state.
+    #[test]
+    fn rcp_canary_check_salt_invalid_with_wrong_rt_still_nmis() {
+        let mut cpu = CortexM33::for_test(0);
+        let mut bus = Bus::default();
+        enable_cp(&mut cpu, 7);
+        // Salt invalid (default), salt = 0. Wrong Rt → still mismatch.
+        cpu.regs.r[2] = 0xDEAD_BEEE; // close-but-wrong
+        let (hw0, hw1) = encode_mcr2(0, 1, 2, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    /// rcp_btrue with Rt = a high-bit-set value (not 1) raises NMI.
+    /// Existing test only covers Rt = 0; this fills the > 1 boundary.
+    #[test]
+    fn rcp_btrue_high_bit_value_raises_nmi() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        cpu.regs.r[0] = 0x8000_0000; // not 1
+        let (hw0, hw1) = encode_mcr2(2, 0, 0, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    /// rcp_bvalid with Rt = u32::MAX raises NMI. Existing tests cover
+    /// 0, 1, 2; this exercises the upper boundary explicitly.
+    #[test]
+    fn rcp_bvalid_max_u32_raises_nmi() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        cpu.regs.r[5] = u32::MAX;
+        let (hw0, hw1) = encode_mcr2(1, 0, 5, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    /// CP7 invalid hw0_high (e.g. 0xED) — neither MCR/MRC nor MCRR/MRRC
+    /// — must silent-NOP via the `_ => 1` arm of `cp7_rcp`. The outer
+    /// `thumb32_coprocessor` dispatch only filters on the top *nibble*
+    /// (0xE / 0xF), not the full byte, so 0xED-prefixed encodings reach
+    /// CP7 and exercise the residual arm at line 549.
+    #[test]
+    fn cp7_invalid_hw0_high_silent_nop() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 7);
+        // hw0 = 0xED.., coproc=7 in hw1[11:8].
+        let hw0: u16 = 0xED00;
+        let hw1: u16 = 7u16 << 8; // coproc=7
+        let cy = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cy, 1);
+        assert!(cpu.pending_fault.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // DCP transfer family — opc1 != 0 silent NOP without changing state
+    // -------------------------------------------------------------------
+
+    /// Reserved opc1 (e.g. 2) for DCP transfer family must silent-NOP
+    /// without touching the half register file. Locks the early-return
+    /// at line 295 with a stronger postcondition than
+    /// `dcp_transfer_reserved_opc1_silent_nop`.
+    #[test]
+    fn dcp_transfer_reserved_opc1_does_not_touch_halves() {
+        let (mut cpu, mut bus) = make_env();
+        enable_cp(&mut cpu, 4);
+        cpu.dcp_set_half(0, 0xCAFE_BABE);
+        cpu.dcp_set_half(1, 0xDEAD_BEEF);
+        let halves_before = (0..16).map(|i| cpu.dcp_get_half(i)).collect::<Vec<_>>();
+        cpu.regs.r[0] = 0x1111_2222;
+        // MCR opc1=2 (reserved) — must NOT write half A of d[0].
+        let hw0: u16 = 0xEE00 | (2u16 << 5);
+        let hw1: u16 = (4u16 << 8) | 0x10; // bit4=1 (MCR), op2=0, CRm=0
+        let cy = cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cy, 1);
+        let halves_after = (0..16).map(|i| cpu.dcp_get_half(i)).collect::<Vec<_>>();
+        assert_eq!(
+            halves_before, halves_after,
+            "reserved opc1 must not touch DCP halves"
+        );
     }
 }

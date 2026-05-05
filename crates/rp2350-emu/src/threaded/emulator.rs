@@ -3028,6 +3028,376 @@ mod tests {
             // worker consumed the bit into the core's NVIC.
             assert_eq!(threaded.shared.atomics.irq_pending_load(0), 0);
         }
+
+        // =================================================================
+        // stage7_branch_coverage: branches missed by stage5_coverage
+        // =================================================================
+
+        /// Line 273 — `from_emulator` with `pending_fifo_event = None`
+        /// (fresh emulator) takes the `if let Some(receiver) = ...` else
+        /// branch: no `event_flag` is set. The "Some" arm has its own
+        /// regression test (`from_emulator_preserves_pending_fifo_event`);
+        /// this locks the None-arm contract.
+        #[test]
+        fn from_emulator_with_no_pending_fifo_event_leaves_event_flags_clear() {
+            let emu = Emulator::new(Config::default());
+            // Default Sio leaves pending_fifo_event = None.
+            assert!(emu.bus.sio.pending_fifo_event.is_none());
+
+            let threaded = ThreadedEmulator::from_emulator(emu);
+            assert!(
+                !threaded.shared.atomics.event_flag[0].load(Ordering::Acquire),
+                "no pending FIFO wake → event_flag[0] stays clear"
+            );
+            assert!(
+                !threaded.shared.atomics.event_flag[1].load(Ordering::Acquire),
+                "no pending FIFO wake → event_flag[1] stays clear"
+            );
+        }
+
+        /// Line 596 — when core 0's worker returns Ok and the core's
+        /// `bootrom_hook_fired` flag is set, `run_quanta_checked` ORs it
+        /// into the host-visible `bootrom_hook_fired` so
+        /// `shutdown_requested()` returns true. Drives the latch by
+        /// pre-setting the flag on `core0` before handoff (the same drain
+        /// site `lib.rs:707-717` exercises serially).
+        #[test]
+        fn run_quanta_drains_core0_bootrom_hook_into_shutdown_requested() {
+            let mut emu = Emulator::new(Config::default());
+            // Pre-seed the latch so the post-join OR fires for core 0.
+            emu.core_mut(0).bootrom_hook_fired = true;
+
+            let mut threaded = ThreadedEmulator::from_emulator(emu);
+            threaded.shared.atomics.set_halted(0);
+            threaded.shared.atomics.set_halted(1);
+            // shutdown_requested is seeded from Emulator::shutdown_requested
+            // (which is false here) — must flip true after the drain.
+            assert!(!threaded.shutdown_requested());
+
+            threaded.run_quanta(1);
+
+            assert!(
+                threaded.shutdown_requested(),
+                "core0 bootrom_hook_fired must propagate to shutdown_requested"
+            );
+            // Sticky: a subsequent run keeps the flag latched even if the
+            // hook didn't re-fire (halted core never re-asserts).
+            threaded.run_quanta(1);
+            assert!(threaded.shutdown_requested());
+        }
+
+        /// Line 603 — same as above but for core 1, locking the
+        /// per-core OR-into independently.
+        #[test]
+        fn run_quanta_drains_core1_bootrom_hook_into_shutdown_requested() {
+            let mut emu = Emulator::new(Config::default());
+            emu.core_mut(1).bootrom_hook_fired = true;
+
+            let mut threaded = ThreadedEmulator::from_emulator(emu);
+            threaded.shared.atomics.set_halted(0);
+            threaded.shared.atomics.set_halted(1);
+            assert!(!threaded.shutdown_requested());
+
+            threaded.run_quanta(1);
+
+            assert!(
+                threaded.shutdown_requested(),
+                "core1 bootrom_hook_fired must propagate to shutdown_requested"
+            );
+        }
+
+        /// Line 374 — `Emulator::shutdown_requested` is plumbed through
+        /// `from_emulator` so a hook fired on the serial path before
+        /// promotion is observable post-handoff via
+        /// `ThreadedEmulator::shutdown_requested`. Mutates the public
+        /// field via `Emulator` destructure-time `shutdown_requested`
+        /// binding.
+        #[test]
+        fn from_emulator_carries_shutdown_requested_seed() {
+            let mut emu = Emulator::new(Config::default());
+            emu.shutdown_requested = true;
+
+            let threaded = ThreadedEmulator::from_emulator(emu);
+            assert!(
+                threaded.shutdown_requested(),
+                "Emulator::shutdown_requested must seed ThreadedEmulator::bootrom_hook_fired"
+            );
+        }
+
+        /// Line 771 — the `&&` short-circuit in
+        /// `if shared.atomics.is_wfe_waiting(idx) && event_flag_consume(idx)`.
+        /// With wfe_waiting=true but event_flag=false the second arm is
+        /// false, the body skips, and `wfe_waiting` STAYS set after the
+        /// quantum (no wake happened). Counterpart to the existing
+        /// `wfe_waiting_early_wake_via_event_flag` which covers the
+        /// both-true path.
+        #[test]
+        fn wfe_waiting_without_event_flag_does_not_clear() {
+            let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            threaded.shared.atomics.set_halted(0);
+            threaded.shared.atomics.set_halted(1);
+            // Park core 0 on WFE; deliberately do NOT set event_flag.
+            threaded.shared.atomics.set_wfe_waiting(0);
+            assert!(threaded.shared.atomics.is_wfe_waiting(0));
+            assert!(!threaded.shared.atomics.event_flag_load(0));
+
+            threaded.run_quanta(1);
+
+            // No event was pending, so the short-circuit took its
+            // false branch and wfe_waiting stays set.
+            assert!(
+                threaded.shared.atomics.is_wfe_waiting(0),
+                "wfe_waiting must remain set when event_flag is unset"
+            );
+        }
+
+        /// Line 809 — the post-step
+        /// `if shared.atomics.is_wfe_waiting(idx) { break; }` inside the
+        /// inner stepping loop. A real WFE instruction ran by the core
+        /// in mid-quantum must set `wfe_waiting`, the inner-loop break
+        /// must fire, and the worker must rendezvous immediately at the
+        /// barrier without spinning further.
+        ///
+        /// Program: WFE (0xBF20) followed by NOPs. With event_flag=false
+        /// (no pending event) the WFE handler sets wfe_waiting and the
+        /// next iteration of the `while core.cycles() < target` loop
+        /// breaks via line 809 instead of running the NOPs.
+        #[test]
+        fn core_worker_inner_loop_breaks_on_post_step_wfe() {
+            let mut emu = Emulator::new(Config::default());
+            // Program at 0x2000_0100:
+            //   WFE   (0xBF20)   — sets wfe_waiting on this CPU
+            //   NOP   (0xBF00)   — must NOT execute after WFE breaks
+            //   NOP
+            //   NOP
+            let prog: [u8; 8] = [0x20, 0xBF, 0x00, 0xBF, 0x00, 0xBF, 0x00, 0xBF];
+            emu.load_image(0x2000_0100, &prog);
+            // SP + reset vector at 0x2000_0000.
+            let sp: u32 = 0x2001_0000;
+            let reset_pc: u32 = 0x2000_0101; // Thumb bit
+            let vectors: [u8; 8] = [
+                (sp & 0xFF) as u8,
+                ((sp >> 8) & 0xFF) as u8,
+                ((sp >> 16) & 0xFF) as u8,
+                ((sp >> 24) & 0xFF) as u8,
+                (reset_pc & 0xFF) as u8,
+                ((reset_pc >> 8) & 0xFF) as u8,
+                ((reset_pc >> 16) & 0xFF) as u8,
+                ((reset_pc >> 24) & 0xFF) as u8,
+            ];
+            emu.load_image(0x2000_0000, &vectors);
+            emu.core_mut(0).regs.set_pc(0x2000_0100);
+            emu.core_mut(0).regs.set_sp(sp);
+
+            let mut threaded = ThreadedEmulator::from_emulator(emu);
+            // Halt core 1 so only core 0's worker exercises the WFE break.
+            threaded.shared.atomics.set_halted(1);
+            // event_flag must be false so WFE actually parks the core.
+            assert!(!threaded.shared.atomics.event_flag_load(0));
+
+            threaded.run_quanta(1);
+
+            // Post-quantum: core 0 executed WFE, the post-step check at
+            // line 809 broke the inner loop, and wfe_waiting is set.
+            assert!(
+                threaded.shared.atomics.is_wfe_waiting(0),
+                "WFE must have parked core 0 (set wfe_waiting via core::wfe)"
+            );
+            // PC advanced past the WFE (Thumb-16, +2) — proving WFE
+            // executed exactly once before the inner-loop break fired.
+            // Without the line-809 break, subsequent NOPs at 0x2000_0102+
+            // would have run too, but they don't move PC differently from
+            // a correctly-broken loop because the first re-entry top-of-
+            // quantum check would still flag wfe_waiting. The cycle count
+            // is the cleaner signal: only one instruction executed.
+            let core_cycles = threaded.core_cycles(0);
+            assert!(
+                core_cycles >= 1 && core_cycles < threaded.step_quantum as u64,
+                "core 0 should have stopped early on WFE (cycles={core_cycles})"
+            );
+        }
+
+        /// Lines 591/602/644 (Ok arms) and 664 None branch — happy-path
+        /// timing-disabled run that takes none of the panic paths.
+        /// Distinct from `core_worker_inner_loop_steps_and_drains_invalidations`
+        /// in that this asserts the post-run state explicitly: `core0`
+        /// + `core1` + `pio_blocks` all hold `Some(_)` (no worker dropped),
+        /// `last_run_timings` stays `None`, and `poisoned` is false.
+        #[test]
+        fn run_quanta_happy_path_preserves_owned_state() {
+            let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            threaded.shared.atomics.set_halted(0);
+            threaded.shared.atomics.set_halted(1);
+            // Pre-condition: every owned slot starts populated.
+            assert!(threaded.core0.is_some());
+            assert!(threaded.core1.is_some());
+            assert!(threaded.pio_blocks.is_some());
+
+            threaded.run_quanta(2);
+
+            // Post-condition: the Ok arms at 591/602 reassembled core0
+            // and core1, the !any_pio_err branch at 630 reassembled
+            // pio_blocks, the rc Ok arm extracted coord timings (which
+            // we discard since timing is off), and the first_panic None
+            // branch at 664 left the instance non-poisoned.
+            assert!(threaded.core0.is_some(), "core0 reassembled");
+            assert!(threaded.core1.is_some(), "core1 reassembled");
+            assert!(threaded.pio_blocks.is_some(), "pio_blocks reassembled");
+            assert!(threaded.last_run_timings.is_none(), "timing disabled");
+            assert!(!threaded.poisoned, "no panic ⇒ not poisoned");
+        }
+
+        /// Reuse-after-poison guard: after a TestPanic-driven PIO panic,
+        /// the next `run_quanta` call must hit the
+        /// `assert!(!self.poisoned, ...)` at line 498-501. Locks the
+        /// "drop and rebuild" contract for the poisoned state.
+        #[cfg(feature = "testing")]
+        #[test]
+        #[should_panic(expected = "poisoned by prior worker panic")]
+        fn run_quanta_on_poisoned_emulator_asserts() {
+            let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            threaded.shared.atomics.set_halted(0);
+            threaded.shared.atomics.set_halted(1);
+            threaded
+                .shared
+                .pio
+                .send_command(PioCommand::TestPanic { block: 0 });
+
+            // First call panics through the worker → instance poisoned.
+            // We catch_unwind to keep the test stable across the
+            // expected-substring matchers.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                threaded.run_quanta(1)
+            }));
+            assert!(threaded.poisoned);
+
+            // Second call hits the entry-point assert and panics with
+            // the expected message — caught by #[should_panic] above.
+            threaded.run_quanta(1);
+        }
+
+        /// `RunError` Debug + Eq + Clone derives: covers the discriminant
+        /// formatters and the equality contract used by the
+        /// `EmulatorError` lift in lib.rs. Important for callers that
+        /// compare run errors across one-shot reentry.
+        #[test]
+        fn run_error_derives_round_trip() {
+            use crate::threaded::WorkerName;
+            let p1 = RunError::Panic {
+                which: WorkerName::Pio0,
+                message: "boom".into(),
+            };
+            let p2 = p1.clone();
+            assert_eq!(p1, p2);
+            let _ = format!("{:?}", p1);
+
+            let t1 = RunError::Timeout {
+                which: WorkerName::Coord,
+                elapsed_ms: 5_000,
+            };
+            let t2 = t1.clone();
+            assert_eq!(t1, t2);
+            let _ = format!("{:?}", t1);
+
+            // Different variants are not equal.
+            assert_ne!(p1, t1);
+        }
+
+        /// `apply_pio_command` with a SetClkDiv whose `sm < 4` exercises
+        /// the false branch of `if sm >= 4` (line 964) end-to-end, with
+        /// the actual SMn_CLKDIV write landing in the block. Distinct
+        /// from `apply_pio_command_setclkdiv_out_of_range_skips` (which
+        /// covers the true branch).
+        #[test]
+        fn apply_pio_command_setclkdiv_in_range_writes_block() {
+            let pio = ThreadedPio::new();
+            let mut block = PioBlock::new();
+            apply_pio_command(
+                &mut block,
+                0,
+                &pio,
+                PioCommand::SetClkDiv {
+                    block: 0,
+                    sm: 2,
+                    int_div: 0x0042,
+                    frac_div: 0x80,
+                    alias: 0,
+                },
+            );
+            // SM2_CLKDIV at 0x0C8 + 2*0x18 = 0x0F8.
+            let val = block.read32(0x0F8);
+            assert_eq!(val >> 16, 0x0042, "INT field landed");
+            assert_eq!((val >> 8) & 0xFF, 0x80, "FRAC field landed");
+        }
+
+        /// `apply_pio_command` with a WriteInstrMem whose `addr < 32`
+        /// covers the false branch of `if addr >= 32` (line 951) with
+        /// the actual write landing in INSTR_MEM. Distinct from
+        /// `apply_pio_command_instrmem_out_of_range_skips`.
+        #[test]
+        fn apply_pio_command_instrmem_in_range_writes_block() {
+            let pio = ThreadedPio::new();
+            let mut block = PioBlock::new();
+            apply_pio_command(
+                &mut block,
+                0,
+                &pio,
+                PioCommand::WriteInstrMem {
+                    block: 0,
+                    addr: 5,
+                    value: 0x1234,
+                    alias: 0,
+                },
+            );
+            // INSTR_MEM5 at 0x048 + 5*4 = 0x05C.
+            assert_eq!(block.instr_mem()[5], 0x1234);
+        }
+
+        /// Line 876 — when `read_sm_enabled(block_idx) == 0` the PIO
+        /// worker skips `step_n_with_pins` and `write_irq_flags`, but
+        /// still publishes pads (HLD V5 §2.1). Concretely: a
+        /// freshly-built ThreadedEmulator has all SM masks at 0 and a
+        /// `run_quanta(1)` must (a) not assert any IRQ, (b) leave the
+        /// pad snapshot at zero. The complement (mask != 0) is covered
+        /// by the §4 item 2 concurrent-pads test.
+        #[test]
+        fn pio_worker_skips_step_when_sm_enabled_is_zero() {
+            let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));
+            threaded.shared.atomics.set_halted(0);
+            threaded.shared.atomics.set_halted(1);
+
+            // Pre-conditions: all SM masks are zero.
+            assert_eq!(threaded.shared.pio.read_sm_enabled(0), 0);
+            assert_eq!(threaded.shared.pio.read_sm_enabled(1), 0);
+            assert_eq!(threaded.shared.pio.read_sm_enabled(2), 0);
+
+            threaded.run_quanta(1);
+
+            // Post: pads still zero (worker took the skip arm), no IRQ
+            // flags were published.
+            assert_eq!(threaded.shared.pio.read_pads(0), (0, 0));
+            assert_eq!(threaded.shared.pio.read_pads(1), (0, 0));
+            assert_eq!(threaded.shared.pio.read_pads(2), (0, 0));
+        }
+
+        /// `split_ok` Some path — a Some((block, timings)) input must
+        /// be split into two Somes preserving both halves.
+        #[test]
+        fn split_ok_some_input_yields_two_somes() {
+            let block = PioBlock::new();
+            let timings = PerWorkerTimings::default();
+            let (b, t) = split_ok(Some((block, timings)));
+            assert!(b.is_some());
+            assert!(t.is_some());
+        }
+
+        /// `split_ok` None path — a None input maps to (None, None).
+        #[test]
+        fn split_ok_none_input_yields_two_nones() {
+            let (b, t) = split_ok(None);
+            assert!(b.is_none());
+            assert!(t.is_none());
+        }
     }
 
     // ----- HLD V5 §4 item 6: OneROM-shape soak ---------------------------
