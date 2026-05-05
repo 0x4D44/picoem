@@ -25,7 +25,7 @@ captured or redistributed.
 |---|---|---|---|
 | `sample_gus.trace` | hand-authored test case | ~75 µs | Smoke-test for `picogus_diff_rp2040`'s GUS path. |
 | `monkey_island_theme.trace` | captured under our patched DOSBox-X | ~30 s of game audio | Replay-to-WAV through `picogus_diff_rp2040`'s GUS engine. ~524k events. |
-| `monkey_island_adlib.trace` | captured under our patched DOSBox-X | ~3 s of game audio | Replay through the OPL3/Adlib path of `picogus_diff_rp2040`. ~29k events. |
+| `monkey_island_adlib.trace` | captured under our patched DOSBox-X | ~48 s of game audio | Replay through the OPL3/Adlib path of `picogus_diff_rp2040`. ~29k events spanning trace t=1.54s to t=49.41s; music starts ~t=22s, so a `--duration` cap below ~25s yields an inaudible boot-only capture. |
 
 The Monkey Island traces were captured by running an unmodified
 retail copy of *The Secret of Monkey Island* under DOSBox-X with our
