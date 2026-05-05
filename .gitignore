@@ -67,3 +67,7 @@ rustc-ice-*.txt
 # Python bytecode caches from scripts/ (mutation runner, routing tests).
 __pycache__/
 *.pyc
+
+# full_test_rp2350 markdown reports: program output (timestamped phase
+# summaries written by the binary at runtime), not source. Local-only.
+crates/picoem-harness/tests/results/
