@@ -1,6 +1,6 @@
 [package]
 name = "rp2350-emu"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -92,6 +92,13 @@ required-features = ["testing"]
 # build time.
 [[test]]
 name = "dual_model"
+required-features = ["threading"]
+
+# Coverage-driven smoke tests that drive `WorkerBus` peripheral paths
+# under `ExecutionModel::Threaded`. Same `threading` requirement as
+# `dual_model`; sibling file in `crates/rp2040-emu/tests/`.
+[[test]]
+name = "threaded_bus_paths"
 required-features = ["threading"]
 
 # docs.rs builds on Linux x86_64. Enable all opt-in features so the

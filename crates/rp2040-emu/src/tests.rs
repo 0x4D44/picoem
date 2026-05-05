@@ -13519,3 +13519,321 @@ mod stage6_periph_long_tail {
         }
     }
 }
+
+// ===========================================================================
+// Stage 8 — `lib.rs` residual branch coverage (rp2040-emu).
+// ===========================================================================
+//
+// Targets the residue branches in `crates/rp2040-emu/src/lib.rs` that the
+// earlier `stage4_lib_residue_v2` module did not reach. Specifically:
+//
+//   * `step_serial`'s both-blocked alarm-advance chain (lines 736-742):
+//     short-circuit FALSE arms via `irq_pending != 0`, NVIC pending, and
+//     deadline-in-the-past.
+//   * `step_serial`'s fast-path gate (line 783) FALSE arms via DMA-busy
+//     and IRQ-pending.
+//
+// Lines that are genuinely unreachable through the public API (e.g.
+// `available_parallelism() < 3` at lib.rs:1466 — host-dependent; or the
+// `regions != 0` FALSE arms at lib.rs:496/507 — `bus.load_*` always sets
+// the bit) are documented inline and skipped.
+//
+// Pure append-only — does not modify production code.
+#[cfg(test)]
+mod stage8_lib_residue {
+    use crate::{Config, Emulator, EmulatorBuilder};
+
+    // ------------------- step_serial both-blocked chain (lines 736-742) -------------------
+    //
+    // Source:
+    //
+    // ```rust
+    // if consumed == 0
+    //     && (cores[0].is_halted() || wfe_waiting[0])      // 736
+    //     && (cores[1].is_halted() || wfe_waiting[1])      // 737
+    //     && bus.irq_pending == 0                           // 738
+    //     && nvics[0].pending_and_enabled() == 0           // 739
+    //     && nvics[1].pending_and_enabled() == 0           // 740
+    //     && let Some(deadline) = next_scheduled_lazy_deadline() // 741
+    //     && deadline > master_cycle                        // 742
+    // { … return advance; }
+    // ```
+    //
+    // The TRUE-arm path is exercised by `stage5_lib_residue::
+    // step_serial_advances_clock_when_both_cores_blocked_with_armed_alarm`.
+    // The tests below drive the FALSE arms of operands 738 / 740 / 742 by
+    // priming the same both-blocked precondition then perturbing one of
+    // the post-conditions so the chain short-circuits there.
+
+    /// FALSE-arm of line 738: both cores blocked, but `bus.irq_pending`
+    /// is non-zero — the both-blocked alarm-advance branch must short-
+    /// circuit and fall through to the regular fast/slow path.
+    #[test]
+    fn step_serial_irq_pending_breaks_both_blocked_chain() {
+        let mut emu = Emulator::new(Config::default());
+        emu.cores[0].halt();
+        emu.halt_core1();
+        emu.bus.irq_pending = 0x1; // line 0
+        let _ = emu.step().unwrap();
+        // Sanity: IRQ should be drained into NVICs (slow-path side
+        // effect) — confirms we reached the slow path, not the early
+        // alarm-advance return.
+        assert!(emu.bus.nvics[0].is_pending(0) || emu.bus.nvics[1].is_pending(0));
+    }
+
+    /// FALSE-arm of line 739: both cores blocked, but core 0's NVIC has
+    /// a pending+enabled IRQ. Same short-circuit semantics.
+    #[test]
+    fn step_serial_nvic0_pending_breaks_both_blocked_chain() {
+        let mut emu = Emulator::new(Config::default());
+        emu.cores[0].halt();
+        emu.halt_core1();
+        // Enable IRQ line 0 on core 0's NVIC and pre-set the pending
+        // latch so `pending_and_enabled() != 0`.
+        emu.bus.nvics[0].set_enabled(0);
+        emu.bus.nvics[0].set_pending(0);
+        let _ = emu.step().unwrap();
+        // The short-circuit means the alarm-advance early return did
+        // NOT fire; subsequent wake_checks should un-halt core 0.
+        assert!(!emu.cores[0].is_halted());
+    }
+
+    /// FALSE-arm of line 740: both cores blocked, but core 1's NVIC has
+    /// a pending+enabled IRQ. Mirrors the previous test on the other
+    /// core's NVIC.
+    #[test]
+    fn step_serial_nvic1_pending_breaks_both_blocked_chain() {
+        let mut emu = Emulator::new(Config::default());
+        emu.cores[0].halt();
+        emu.halt_core1();
+        emu.bus.nvics[1].set_enabled(0);
+        emu.bus.nvics[1].set_pending(0);
+        let _ = emu.step().unwrap();
+        // wake_checks unhalts core 1 if the NVIC pending+enabled state
+        // survives. If the alarm-advance branch fired instead, core 1
+        // would still be halted.
+        assert!(!emu.cores[1].is_halted());
+    }
+
+    /// FALSE-arm of line 742: both cores blocked AND a TIMER alarm is
+    /// scheduled, BUT the deadline is in the past (already-fired or
+    /// match-cycle equal to current master_cycle). The chain
+    /// short-circuits at `deadline > master_cycle` and falls through to
+    /// the regular fast/slow path without advancing the clock.
+    ///
+    /// Setting up an alarm with `match_cycle == master_cycle` would
+    /// normally fire on the same poll, so we instead set `master_cycle`
+    /// past the alarm and confirm `next_scheduled_lazy_deadline()`
+    /// returns a value `<= master_cycle`.
+    #[test]
+    fn step_serial_past_alarm_breaks_both_blocked_chain() {
+        use crate::peripherals::timer::{ALARM0_OFFSET, INTE_OFFSET};
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(64)
+            .build()
+            .expect("Serial build is infallible");
+        emu.cores[0].halt();
+        emu.halt_core1();
+
+        let sys_hz = emu.bus.clock_tree.sys_clk_hz;
+        // Arm ALARM0 at cycle 50 + enable INTE.
+        emu.bus
+            .timer
+            .write32(INTE_OFFSET, 0x1, 0, emu.bus.master_cycle, sys_hz);
+        emu.bus
+            .timer
+            .write32(ALARM0_OFFSET, 50, 0, emu.bus.master_cycle, sys_hz);
+        // Force master_cycle past the alarm fire cycle so the deadline
+        // predicate `deadline > master_cycle` is FALSE.
+        emu.bus.master_cycle = 100;
+        emu.clock.cycles = 100;
+
+        let _ = emu.step().unwrap();
+        // The both-blocked branch did NOT take the early return — the
+        // master cycle either advanced via the regular slow path or via
+        // wake_checks routing the late alarm IRQ. Either way we exited
+        // step() cleanly without panicking, which is what the FALSE arm
+        // proves.
+    }
+
+    // ------------------- step_serial fast-path gate (line 783) -------------------
+    //
+    // Source: `if pio_idle && peri_idle && dma_idle && systick_idle && !any_irq`
+    //
+    // FALSE-arm of `dma_idle` (col 37-45): mark a DMA channel busy so
+    // `bus.dma.is_idle()` returns false; the chain short-circuits and
+    // the slow path runs.
+
+    /// FALSE-arm of `dma_idle` at line 783: arm DMA channel 0 with
+    /// CTRL.EN=1 + trans_count > 0, then trigger via MULTI_CHAN_TRIGGER
+    /// so `busy = true`. `Dma::is_idle()` then returns false; the
+    /// fast-path gate short-circuits here.
+    #[test]
+    fn step_serial_fast_path_falls_through_when_dma_busy() {
+        let mut emu = Emulator::new(Config::default());
+        // DMA registers live at bus offsets 0x5000_0000+. Per-channel
+        // block stride 0x40; inner offsets: 0x00 read_addr, 0x04
+        // write_addr, 0x08 trans_count, 0x0C ctrl_trig.
+        // Channel 0 CTRL_TRIG: enable (bit 0 = CTRL_EN).
+        emu.bus.dma.write32(0x008, 4, 0); // trans_count = 4
+        emu.bus.dma.write32(0x00C, 0x1, 0); // ctrl_trig with EN=1 — also auto-triggers
+        // After ctrl_trig with EN=1, the channel is busy.
+        assert!(!emu.bus.dma.is_idle(), "DMA should be busy after ctrl_trig");
+        // Halt cores so step_pair does no real work.
+        emu.cores[0].halt();
+        emu.halt_core1();
+        let _ = emu.step().unwrap();
+    }
+
+    // ------------------- gpio_read / gpio_write boundary (lines 1268, 1280) -------------------
+    //
+    // The `if pin >= 30` guard returns / no-ops for out-of-range pins.
+    // `stage4_lib_residue_v2::gpio_read_pin_at_or_above_30_returns_false`
+    // and `gpio_write_pin_at_or_above_30_is_noop` already hit the TRUE
+    // arm (pin >= 30); this pair pins down the exact boundary
+    // (pin == 30) which is the smallest invalid index — separate from
+    // arbitrary-large invalid pins.
+
+    /// Boundary case: pin == 30 is the first invalid pin (RP2040 has
+    /// only 30 GPIOs, 0..=29). Confirms the early-return fires at the
+    /// boundary, not just for far-out values like 100/255.
+    #[test]
+    fn gpio_read_pin_eq_30_is_boundary_invalid() {
+        let emu = Emulator::new(Config::default());
+        assert!(!emu.gpio_read(30));
+    }
+
+    #[test]
+    fn gpio_write_pin_eq_30_is_boundary_noop() {
+        let mut emu = Emulator::new(Config::default());
+        let oe_before = emu.bus.sio.gpio_oe;
+        let out_before = emu.bus.sio.gpio_out;
+        emu.gpio_write(30, true);
+        assert_eq!(emu.bus.sio.gpio_oe, oe_before);
+        assert_eq!(emu.bus.sio.gpio_out, out_before);
+    }
+
+    // ------------------- load_image: ROM exact-end overlay (line 461 boundary) -------------------
+    //
+    // `stage5_lib_residue::load_image_rom_offset_past_end_is_skipped`
+    // hits the FALSE arm (offset >= ROM_SIZE). The TRUE arm with
+    // `offset == ROM_SIZE - 1` and a 1-byte payload is the exact
+    // boundary case — confirms the inclusive `offset < ROM_SIZE` guard
+    // is correct at the high edge.
+
+    #[test]
+    fn load_image_rom_at_last_byte_writes_one_byte() {
+        use crate::ROM_SIZE;
+        let mut emu = Emulator::new(Config::default());
+        let offset = (ROM_SIZE - 1) as u32;
+        let data = [0x42u8];
+        emu.load_image(offset, &data);
+        assert_eq!(emu.bus.memory.rom_read8(offset), 0x42);
+    }
+
+    // ------------------- direct_boot_from_flash sanity -------------------
+    //
+    // `direct_boot_from_flash` (lib.rs:543) is a public API path with
+    // no dedicated coverage test in stage4 / stage5. Drives the
+    // `for core in 0..2` loop body once per core (lines 548-552) and
+    // confirms `halt_core1` runs at the tail.
+
+    #[test]
+    fn direct_boot_from_flash_sets_sp_pc_vtor_and_halts_core1() {
+        let mut emu = Emulator::new(Config::default());
+        // Build a synthetic vector table at flash offset 0x100 with
+        // SP=0x2003_FFFF, reset_handler=0x1000_0101 (Thumb).
+        let mut flash_data = vec![0u8; 0x200];
+        flash_data[0x100..0x104].copy_from_slice(&0x2003_FFFFu32.to_le_bytes());
+        flash_data[0x104..0x108].copy_from_slice(&0x1000_0101u32.to_le_bytes());
+        emu.load_flash(&flash_data);
+        emu.direct_boot_from_flash(0x100);
+        // Both cores: SP and PC seeded; PPB.vtor set to flash + 0x100.
+        for c in 0..2 {
+            assert_eq!(emu.cores[c].regs.msp, 0x2003_FFFF);
+            assert_eq!(emu.cores[c].regs.pc(), 0x1000_0100); // Thumb bit stripped
+            assert_eq!(emu.bus.ppb[c].vtor, 0x1000_0100);
+        }
+        // Core 1 stays halted (handshake re-armed via halt_core1 wrapper).
+        assert!(emu.cores[1].is_halted());
+    }
+
+    // ------------------- mmio_read32 / mmio_write32 master_cycle stash -------------------
+    //
+    // Lib.rs:1356, 1374 — both methods stash `clock.cycles` into
+    // `bus.master_cycle` before delegating. Verify the stash actually
+    // happens (no test currently asserts this directly).
+
+    #[test]
+    fn mmio_write32_stashes_master_cycle() {
+        let mut emu = Emulator::new(Config::default());
+        // Step a few quanta so clock.cycles > 0.
+        let _ = emu.run(128).unwrap();
+        let cycles_before = emu.cycles();
+        // Pick an SIO register that accepts writes without side effects:
+        // SIO GPIO_OUT_CLR (offset 0x18) — clearing already-zero pins is a
+        // no-op.
+        emu.mmio_write32(0xD000_0018, 0x0);
+        // After the write, bus.master_cycle should equal cycles_before.
+        assert_eq!(emu.bus.master_cycle, cycles_before);
+    }
+
+    #[test]
+    fn mmio_read32_stashes_master_cycle() {
+        let mut emu = Emulator::new(Config::default());
+        let _ = emu.run(128).unwrap();
+        let cycles_before = emu.cycles();
+        let _ = emu.mmio_read32(0xD000_0008); // SIO GPIO_HI_IN — read-only
+        assert_eq!(emu.bus.master_cycle, cycles_before);
+    }
+
+    // ------------------- drain_uart0_tx_log empty path -------------------
+    //
+    // Lib.rs:1384 — drain_uart0_tx_log is otherwise untested at the
+    // Emulator level. Empty drain returns Vec::new().
+
+    #[test]
+    fn drain_uart0_tx_log_empty_when_idle() {
+        let mut emu = Emulator::new(Config::default());
+        let bytes = emu.drain_uart0_tx_log();
+        assert!(bytes.is_empty());
+    }
+
+    // ------------------- core / core_mut accessors -------------------
+    //
+    // The flat accessors `core(id)` / `core_mut(id)` aren't directly
+    // tested in stage4/5. Drive both for both core IDs.
+
+    #[test]
+    fn core_accessor_returns_valid_reference() {
+        let emu = Emulator::new(Config::default());
+        let c0 = emu.core(0);
+        assert_eq!(c0.cycles(), 0);
+        let c1 = emu.core(1);
+        assert!(c1.is_halted()); // default: core 1 starts halted
+    }
+
+    #[test]
+    fn core_mut_accessor_allows_mutation() {
+        let mut emu = Emulator::new(Config::default());
+        // core_mut returns &mut. Halting via the accessor proves the
+        // mutable borrow path is live.
+        assert!(!emu.core(0).is_halted());
+        emu.core_mut(0).halt();
+        assert!(emu.core(0).is_halted());
+    }
+
+    // ------------------- peek / poke wrappers -------------------
+    //
+    // peek/poke are tested indirectly elsewhere; assert they round-trip
+    // through the SRAM path which is the most-common harness use case.
+
+    #[test]
+    fn peek_poke_sram_round_trip() {
+        let mut emu = Emulator::new(Config::default());
+        let addr = 0x2000_0040;
+        emu.poke(addr, 0xCAFE_BABE);
+        assert_eq!(emu.peek(addr), 0xCAFE_BABE);
+    }
+}

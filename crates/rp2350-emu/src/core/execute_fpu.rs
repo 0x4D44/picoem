@@ -1576,3 +1576,138 @@ fn f32_to_f16_bits(v: f32, fpscr_in: u32) -> (u16, u32) {
     }
     (sign | (exp16 << 10) | (rounded as u16 & 0x3FF), flags)
 }
+
+// ============================================================================
+// Test-only accessors (Stage 8 — private helper sweep)
+// ============================================================================
+//
+// Each of the helpers below is private and contributes uncovered branches in
+// `target/cov-full.json`. The accessors below let `tests.rs` exercise each
+// helper directly with carefully chosen inputs, avoiding the cost of routing
+// through the full Thumb-32 dispatch path. None of these wrappers alter
+// production logic; they exist solely to widen the branch coverage surface.
+
+#[cfg(test)]
+pub(crate) fn is_denormal_for_test(v: f32) -> bool {
+    is_denormal(v)
+}
+
+#[cfg(test)]
+pub(crate) fn ftz_input_for_test(fpscr: &mut u32, v: f32) -> f32 {
+    ftz_input(fpscr, v)
+}
+
+#[cfg(test)]
+pub(crate) fn ftz_output_for_test(fpscr: u32, result: f32, exact: f64) -> Option<f32> {
+    ftz_output(fpscr, result, exact)
+}
+
+#[cfg(test)]
+pub(crate) fn apply_dn_for_test(fpscr: u32, result: f32) -> f32 {
+    apply_dn(fpscr, result)
+}
+
+#[cfg(test)]
+pub(crate) fn overflowed_for_test(result: f32, any_input_inf: bool) -> bool {
+    overflowed(result, any_input_inf)
+}
+
+#[cfg(test)]
+pub(crate) fn underflowed_for_test(result: f32, exact: f64) -> bool {
+    underflowed(result, exact)
+}
+
+#[cfg(test)]
+pub(crate) fn is_snan_for_test(v: f32) -> bool {
+    is_snan(v)
+}
+
+#[cfg(test)]
+pub(crate) fn is_mul_inf_zero_for_test(a: f32, b: f32) -> bool {
+    is_mul_inf_zero(a, b)
+}
+
+#[cfg(test)]
+pub(crate) fn canonicalize_nan_for_test(result: f32, a: f32, b: f32) -> f32 {
+    canonicalize_nan(result, a, b)
+}
+
+#[cfg(test)]
+pub(crate) fn canonicalize_nan_unary_for_test(result: f32, a: f32) -> f32 {
+    canonicalize_nan_unary(result, a)
+}
+
+#[cfg(test)]
+pub(crate) fn canonicalize_nan_fma_for_test(
+    result: f32,
+    addend: f32,
+    op1: f32,
+    op2: f32,
+) -> f32 {
+    canonicalize_nan_fma(result, addend, op1, op2)
+}
+
+#[cfg(test)]
+pub(crate) fn vfp_expand_imm_f32_for_test(imm8: u8) -> f32 {
+    vfp_expand_imm_f32(imm8)
+}
+
+#[cfg(test)]
+pub(crate) fn f32_to_i32_rtz_for_test(val: f32) -> i32 {
+    f32_to_i32_rtz(val)
+}
+
+#[cfg(test)]
+pub(crate) fn f32_to_u32_rtz_for_test(val: f32) -> u32 {
+    f32_to_u32_rtz(val)
+}
+
+#[cfg(test)]
+pub(crate) fn f32_to_i32_rmode_for_test(val: f32, rmode: u32) -> i32 {
+    f32_to_i32_rmode(val, rmode)
+}
+
+#[cfg(test)]
+pub(crate) fn f32_to_u32_rmode_for_test(val: f32, rmode: u32) -> u32 {
+    f32_to_u32_rmode(val, rmode)
+}
+
+#[cfg(test)]
+pub(crate) fn fpu_vrint_for_test(val: f32, rmode: u32, fpscr_in: u32, exact: bool) -> (f32, u32) {
+    fpu_vrint(val, rmode, fpscr_in, exact)
+}
+
+#[cfg(test)]
+pub(crate) fn ftz_input_value_for_test(fpscr_in: u32, flags: &mut u32, v: f32) -> f32 {
+    ftz_input_value(fpscr_in, flags, v)
+}
+
+#[cfg(test)]
+pub(crate) fn quieten_nan_for_test(v: f32) -> f32 {
+    quieten_nan(v)
+}
+
+#[cfg(test)]
+pub(crate) fn fpu_maxnum_for_test(a: f32, b: f32) -> f32 {
+    fpu_maxnum(a, b)
+}
+
+#[cfg(test)]
+pub(crate) fn fpu_minnum_for_test(a: f32, b: f32) -> f32 {
+    fpu_minnum(a, b)
+}
+
+#[cfg(test)]
+pub(crate) fn is_snan_f16_for_test(h: u16) -> bool {
+    is_snan_f16(h)
+}
+
+#[cfg(test)]
+pub(crate) fn f16_bits_to_f32_for_test(h: u16, fpscr_in: u32) -> (f32, u32) {
+    f16_bits_to_f32(h, fpscr_in)
+}
+
+#[cfg(test)]
+pub(crate) fn f32_to_f16_bits_for_test(v: f32, fpscr_in: u32) -> (u16, u32) {
+    f32_to_f16_bits(v, fpscr_in)
+}
