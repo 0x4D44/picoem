@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "picoem-harness"
-version = "0.41.3"
+version = "0.41.4"
 dependencies = [
  "chrono",
  "ctrlc",
@@ -2217,7 +2217,7 @@ dependencies = [
 
 [[package]]
 name = "rp2040-emu-tui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -2240,7 +2240,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-emu-tui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "crossterm",
