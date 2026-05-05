@@ -3,7 +3,10 @@ pub(crate) mod coprocessor;
 pub(crate) mod decode;
 pub(crate) mod exceptions;
 mod execute;
+#[cfg(not(test))]
 mod execute_fpu;
+#[cfg(test)]
+pub(crate) mod execute_fpu;
 pub(crate) mod execute_thumb32;
 pub mod registers;
 

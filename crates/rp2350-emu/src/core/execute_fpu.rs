@@ -70,6 +70,13 @@ fn fpscr_rmode(fpscr: u32) -> u32 {
     (fpscr >> 22) & 0x3
 }
 
+/// Test-only accessor for the private `fpscr_set_nzcv` helper (covers all 16
+/// N/Z/C/V combinations independently of the dispatch path).
+#[cfg(test)]
+pub(crate) fn fpscr_set_nzcv_for_test(fpscr: &mut u32, n: bool, z: bool, c: bool, v: bool) {
+    fpscr_set_nzcv(fpscr, n, z, c, v);
+}
+
 // ----- Cumulative exception flags (Phase 7 Stage A.1, HLD §A.1) ------------
 //
 // All six flags are **sticky**: set by the op that triggered them, cleared
