@@ -1823,10 +1823,8 @@ pub const SCENARIOS: &[PeriphScenario] = &[
     // test (`crates/rp2350-emu/tests/dma_quantum_invariance.rs`) gates
     // the §3 fix at higher quanta.
     //
-    // Calibration 2026-05-06: EMU baseline = 67 sysclks.  Pre-silicon-run
-    // band is half-baseline floor (33) to a conservative ceiling (2000).
-    // Re-tighten both bounds against actual silicon measurements once a
-    // probe attaches.
+    // silicon-calibrated 2026-05-06: actual_sysclks = 63 → min=31, max=252
+    // (formula: min = floor(0.5 × actual), max = ceil(4 × actual)).
     //
     // FDEBUG.TXSTALL/RXSTALL are NOT observed because rp2350-emu's PIO
     // model does not currently implement those bits — there is no
@@ -1841,32 +1839,28 @@ pub const SCENARIOS: &[PeriphScenario] = &[
     PeriphScenario {
         name: "dma_pio_rx_paced",
         setup: S_DMA_PIO_RX_PACED,
-        // Initial pre-calibration values; tightened post-silicon-run.
-        max_sysclks: 2_000,
+        max_sysclks: 252,
         observe: O_DMA_PIO_RX_PACED,
         observe_pins: 0,
         custom_sled: Some(SLED_DMA_PIO_RX_PACED),
-        // Half EMU baseline floor (67 / 2 = 33).  See header above.
-        min_sysclks: 33,
+        min_sysclks: 31,
     },
     // HLD V0.1.0 §4.3.2 — DMA paced on DREQ_PIO0_TX0.  CH0 sources 8 words
     // from SRAM into PIO0 SM0 TX FIFO; SM0 runs OUT NULL,32 with AUTOPULL
     // to drain the FIFO so DREQ stays asserted.  Observables: DMA INTR
     // bit 0, BUSY clear, PIO0 SM0 TX FIFO empty.
     //
-    // Calibration 2026-05-06: EMU baseline = 90 sysclks.  Same
-    // half-baseline-floor / 2000-ceiling pre-calibration band as
-    // dma_pio_rx_paced; same FDEBUG model-gap caveat applies (see RX
-    // scenario header above).
+    // silicon-calibrated 2026-05-06: actual_sysclks = 105 → min=52, max=420
+    // (formula: min = floor(0.5 × actual), max = ceil(4 × actual)).
+    // Same FDEBUG model-gap caveat applies (see RX scenario header above).
     PeriphScenario {
         name: "dma_pio_tx_paced",
         setup: S_DMA_PIO_TX_PACED,
-        max_sysclks: 2_000,
+        max_sysclks: 420,
         observe: O_DMA_PIO_TX_PACED,
         observe_pins: 0,
         custom_sled: Some(SLED_DMA_PIO_TX_PACED),
-        // Half EMU baseline floor (90 / 2 = 45).  See header above.
-        min_sysclks: 45,
+        min_sysclks: 52,
     },
     // Phase 1 Expansion — SIO unsigned divider.
     PeriphScenario {
