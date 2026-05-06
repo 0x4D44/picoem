@@ -703,12 +703,32 @@ impl Dma {
     // Per-cycle tick
     // -------------------------------------------------------------
 
-    /// Advance DMA by one system clock. Issues at most one transfer
-    /// across all channels (fixed-priority, lowest index wins).
+    /// Advance DMA by one system clock. Fires **every** ready channel
+    /// in low-to-high index order within this tick — not just the
+    /// lowest-index ready one.
     ///
-    /// Snapshots DREQ lines before issuing any bus access so peripheral
-    /// state changes produced by the transfer don't feed back into
-    /// same-cycle DREQ arbitration.
+    /// This is the silicon-correct semantic for workloads where
+    /// multiple channels are paced on a shared DREQ source (e.g.
+    /// OneROM programs CH0 and CH1 with the same `TREQ_SEL=12`,
+    /// `DREQ_PIO1_RX0`). Pre-Stage-7 the V1 fixed-priority
+    /// (lowest-index-wins) loop `break`'d after the first ready
+    /// channel; CH0 monopolised every DREQ pulse and CH1 starved
+    /// indefinitely. The GlueDma harness shim was masking the
+    /// regression by aborting both channels every cycle and pumping
+    /// CH1 manually; deleting GlueDma in Stage 5 exposed the bug.
+    ///
+    /// DREQ snapshot semantics: `bus.collect_dreqs()` is taken **once**
+    /// at tick start. Every channel decides "ready" against this
+    /// start-of-tick state, even if an earlier channel's bus access
+    /// in the same tick would have changed the underlying peripheral
+    /// (e.g. CH0 draining an RX FIFO that CH1 is also paced on).
+    /// `busy` is re-fetched per iteration so a chain-fired channel
+    /// armed mid-tick by an earlier `issue_transfer` is observed
+    /// correctly.
+    ///
+    /// Rationale: `wrk_journals/2026.05.06 - JRN - DMA Pacing Within
+    /// Step Quantum Implementation.md` § "Phase 2 — silicon
+    /// validation".
     pub fn tick(&mut self, bus: &mut Bus) {
         // DMA-internal timers (TREQ 59–62). Format: X[31:16]:Y[15:0],
         // rate = X/Y of sys_clk. Accumulator fires when accum >= Y.
@@ -738,26 +758,24 @@ impl Dma {
         }
 
         let dreqs = bus.collect_dreqs();
-        let mut selected: Option<usize> = None;
         for i in 0..NUM_CHANNELS {
-            let ch = &self.channels[i];
-            if !ch.busy {
+            // Re-fetch `busy` each iteration: an earlier channel's
+            // `issue_transfer` may have chain-armed a higher-index
+            // channel (CHAIN_TO), and that newly-armed channel is
+            // eligible to fire in the same tick if the start-of-tick
+            // DREQ snapshot says so.
+            if !self.channels[i].busy {
                 continue;
             }
-            let treq = ch.treq_sel();
+            let treq = self.channels[i].treq_sel();
             let ready = treq == DREQ_FORCE
                 || ((DREQ_TIMER0..=DREQ_TIMER3).contains(&treq)
                     && self.timer_dreq_asserted[(treq - DREQ_TIMER0) as usize])
                 || (treq < 64 && (dreqs >> treq) & 1 != 0);
             if ready {
-                selected = Some(i);
-                break;
+                self.issue_transfer(i, bus);
             }
         }
-        let Some(idx) = selected else {
-            return;
-        };
-        self.issue_transfer(idx, bus);
     }
 
     fn issue_transfer(&mut self, ch_idx: usize, bus: &mut Bus) {
@@ -1280,33 +1298,45 @@ mod tests {
         let ctrl0 = make_ctrl(true, 2, true, true, 63, 1, 0, false);
         bus.write32(DMA_BASE + 0x0C, ctrl0, 0);
 
-        // Channel 1: pre-program (no trigger yet)
+        // Channel 1: pre-program (no trigger yet). Use TRANS_COUNT=2
+        // so post-Stage-7 chain-fires-in-same-tick still leaves CH1
+        // BUSY for the second-tick BUSY observation below.
         let src1: u32 = 0x2000_0300;
         let dst1: u32 = 0x2000_0400;
-        bus.write32(src1, 0xBBBB_1111, 0);
+        for i in 0..2u32 {
+            bus.write32(src1 + i * 4, 0xBBBB_1110 + i, 0);
+        }
 
         // Use AL1_CTRL (no trigger) to write ch1 CTRL
         bus.write32(DMA_BASE + 0x40, src1, 0); // ch1 READ_ADDR
         bus.write32(DMA_BASE + 0x40 + 0x04, dst1, 0); // ch1 WRITE_ADDR
-        bus.write32(DMA_BASE + 0x40 + 0x08, 1, 0); // ch1 TRANS_COUNT
+        bus.write32(DMA_BASE + 0x40 + 0x08, 2, 0); // ch1 TRANS_COUNT=2
         let ctrl1 = make_ctrl(true, 2, true, true, 63, 1, 0, false);
         bus.write32(DMA_BASE + 0x40 + 0x10, ctrl1, 0); // ch1 AL1_CTRL (no trigger)
 
-        // Tick once: ch0 completes, chains to ch1
+        // Tick once: CH0 completes, chains to CH1. Stage-7 onwards CH1
+        // also fires its first transfer in the same tick (low-to-high
+        // iteration with start-of-tick DREQ snapshot, TREQ=63 force =
+        // always ready). CH1 still has 1 transfer left → BUSY.
         bus.tick_dma();
-        assert_eq!(bus.read32(dst0, 0), 0xAAAA_0000);
+        assert_eq!(bus.read32(dst0, 0), 0xAAAA_0000, "CH0 transfer 1 lands");
+        assert_eq!(
+            bus.read32(dst1, 0),
+            0xBBBB_1110,
+            "CH1 chain-fires its first transfer in the same tick (Stage 7 semantics)"
+        );
 
-        // ch1 should now be BUSY
+        // ch1 should still be BUSY (1 transfer left of 2).
         let ch1_ctrl = bus.read32(DMA_BASE + 0x40 + 0x0C, 0);
         assert_ne!(
             ch1_ctrl & CTRL_BUSY,
             0,
-            "channel 1 must be BUSY after chain"
+            "channel 1 must remain BUSY (TRANS_COUNT=2, 1 left)"
         );
 
-        // Tick again: ch1 completes
+        // Tick again: ch1 completes its second/final transfer.
         bus.tick_dma();
-        assert_eq!(bus.read32(dst1, 0), 0xBBBB_1111);
+        assert_eq!(bus.read32(dst1 + 4, 0), 0xBBBB_1111, "CH1 transfer 2 lands");
 
         // Both INTR bits should be set
         let intr = bus.read32(DMA_BASE + REG_INTR, 0);
@@ -2267,6 +2297,71 @@ mod tests {
             bus.atomics.irq_pending_load(1) & (1u64 << IRQ_DMA_IRQ_0),
             0,
             "IRQ_DMA_IRQ_0 must be asserted via INTF0 force-IRQ even when DMA is otherwise idle (core 1)"
+        );
+    }
+
+    /// Stage 7: two channels paced on `DREQ_PIO0_RX0` must both fire in
+    /// a single tick when the shared source asserts. Pre-Stage-7 the
+    /// V1 fixed-priority (lowest-index-wins) arbitration meant CH0
+    /// monopolised every DREQ pulse and CH1 starved forever — the
+    /// regression that surfaced after the GlueDma cleanup against the
+    /// OneROM full-system smoke (CH0 and CH1 both programmed with
+    /// `TREQ_SEL=12` for `DREQ_PIO1_RX0`). Post-Stage-7 the DREQ is
+    /// snapshotted at tick start and every ready channel fires in
+    /// low-to-high order within the same tick.
+    #[test]
+    fn two_channels_share_dreq_both_fire() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        // Single word in PIO0 SM0 RX FIFO is enough: CH0 drains it,
+        // CH1 only uses the start-of-tick DREQ snapshot for pacing
+        // and reads from a scratch SRAM word, so its bus access
+        // doesn't depend on the FIFO state at the moment of issue.
+        bus.pio[0].push_rx(0, 0xCAFE_F00D);
+
+        // Scratch addresses (clear of fixture pre-fills used elsewhere).
+        let scratch_src: u32 = 0x2000_0500;
+        let scratch1: u32 = 0x2000_0600;
+        let scratch2: u32 = 0x2000_0700;
+        bus.write32(scratch_src, 0xDEAD_BEEF, 0);
+
+        // CH0: paced on DREQ_PIO0_RX0 (TREQ=4), reads PIO0 RXF0
+        // (offset 0x020 from PIO0_BASE 0x5020_0000), writes scratch1.
+        // No incr (FIFO MMIO + single-word transfer).
+        let pio0_rxf0: u32 = 0x5020_0000 + 0x020;
+        bus.write32(DMA_BASE + 0 * 0x40 + 0x00, pio0_rxf0, 0);
+        bus.write32(DMA_BASE + 0 * 0x40 + 0x04, scratch1, 0);
+        bus.write32(DMA_BASE + 0 * 0x40 + 0x08, 1, 0);
+        let ctrl = make_ctrl(true, 2, false, false, 4, 0, 0, false);
+        bus.write32(DMA_BASE + 0 * 0x40 + 0x0C, ctrl, 0);
+
+        // CH1: paced on DREQ_PIO0_RX0 (same TREQ=4), reads scratch_src,
+        // writes scratch2.
+        bus.write32(DMA_BASE + 1 * 0x40 + 0x00, scratch_src, 0);
+        bus.write32(DMA_BASE + 1 * 0x40 + 0x04, scratch2, 0);
+        bus.write32(DMA_BASE + 1 * 0x40 + 0x08, 1, 0);
+        bus.write32(DMA_BASE + 1 * 0x40 + 0x0C, ctrl, 0);
+
+        // ONE tick — DREQ snapshot taken at tick start should arm both.
+        bus.tick_dma();
+
+        // Both channels must have fired exactly once.
+        assert_eq!(
+            bus.read32(scratch1, 0),
+            0xCAFE_F00D,
+            "CH0 must transfer (drained the RX FIFO word)"
+        );
+        assert_eq!(
+            bus.read32(scratch2, 0),
+            0xDEAD_BEEF,
+            "CH1 must transfer in the same tick (start-of-tick DREQ snapshot)"
+        );
+        let intr = bus.read32(DMA_BASE + REG_INTR, 0);
+        assert_eq!(
+            intr & 0b11,
+            0b11,
+            "INTR bits 0 and 1 must both latch (both channels completed in one tick)"
         );
     }
 

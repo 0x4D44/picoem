@@ -28732,32 +28732,39 @@ mod stage3_dma_residue {
         assert!(bus.dma.is_idle());
     }
 
-    /// Two channels ready in the same tick — lowest index wins (line
-    /// `selected = Some(i); break`). Channel 0 finishes first, then
-    /// channel 5 finishes on the next tick.
+    /// Two channels ready in the same tick — Stage 7 semantics: each
+    /// fires its own bus access in low-to-high index order within
+    /// the same tick (start-of-tick DREQ snapshot, no early break).
+    /// Pre-Stage-7 only the lowest-index channel fired per tick; the
+    /// regression that surfaced after the GlueDma cleanup against the
+    /// OneROM full-system smoke (CH0 and CH1 paced on the same DREQ).
     #[test]
     fn fixed_priority_lower_index_wins() {
         let mut bus = Bus::new();
         release_dma(&mut bus);
         bus.write32(0x2000_0100, 0xA001, 0);
         bus.write32(0x2000_0200, 0xB005, 0);
-        let c = ctrl(true, 2, true, true, DREQ_FORCE, 0, 0, false);
-        program(&mut bus, 0, 0x2000_0100, 0x2000_0300, 1, c);
-        program(&mut bus, 5, 0x2000_0200, 0x2000_0400, 1, c);
+        // Each channel self-chains (chain=ch_idx) so completion of one
+        // doesn't re-arm the other via the chain handler — keeps the
+        // test focused on per-tick arbitration only.
+        let c0 = ctrl(true, 2, true, true, DREQ_FORCE, 0, 0, false);
+        let c5 = ctrl(true, 2, true, true, DREQ_FORCE, 5, 0, false);
+        program(&mut bus, 0, 0x2000_0100, 0x2000_0300, 1, c0);
+        program(&mut bus, 5, 0x2000_0200, 0x2000_0400, 1, c5);
         // Trigger both via CTRL_TRIG.
-        bus.write32(DMA_BASE + CH_CTRL_TRIG, c, 0);
-        bus.write32(DMA_BASE + 5 * 0x40 + CH_CTRL_TRIG, c, 0);
-        // First tick — channel 0 wins; channel 5 still busy.
+        bus.write32(DMA_BASE + CH_CTRL_TRIG, c0, 0);
+        bus.write32(DMA_BASE + 5 * 0x40 + CH_CTRL_TRIG, c5, 0);
+        // One tick — both channels fire (low-to-high) and complete.
         bus.tick_dma();
         let r0 = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
         let r5 = bus.read32(DMA_BASE + 5 * 0x40 + CH_CTRL_TRIG, 0);
-        assert_eq!(r0 & CTRL_BUSY, 0, "channel 0 must complete first");
-        assert_ne!(r5 & CTRL_BUSY, 0, "channel 5 must still be busy");
+        assert_eq!(r0 & CTRL_BUSY, 0, "channel 0 must complete in this tick");
+        assert_eq!(
+            r5 & CTRL_BUSY,
+            0,
+            "channel 5 must also complete in the same tick (Stage 7)"
+        );
         assert_eq!(bus.read32(0x2000_0300, 0), 0xA001);
-        // Second tick — channel 5 wins now.
-        bus.tick_dma();
-        let r5 = bus.read32(DMA_BASE + 5 * 0x40 + CH_CTRL_TRIG, 0);
-        assert_eq!(r5 & CTRL_BUSY, 0);
         assert_eq!(bus.read32(0x2000_0400, 0), 0xB005);
     }
 
@@ -28893,6 +28900,15 @@ mod stage3_dma_residue {
     /// `chain_to < NUM_CHANNELS` guard is true (15 < 16). Ch15 must
     /// have non-zero reload to actually arm — pre-program it with
     /// reload=1, and verify it fires.
+    ///
+    /// Stage 7 semantics: CH0 fires at iteration i=0 and chain-arms
+    /// CH15; the same tick's loop continues low-to-high and CH15
+    /// fires when iteration reaches i=15 (start-of-tick DREQ snapshot
+    /// + TREQ=63 force = always ready). Both CH0 and CH15 complete in
+    /// the same `tick_dma()` call. Pre-Stage-7 the loop `break`'d
+    /// after CH0 and CH15 was observed BUSY-but-not-fired between
+    /// ticks; the new oracle is "destination has the data after one
+    /// tick".
     #[test]
     fn chain_to_fifteen_arms_target() {
         let mut bus = Bus::new();
@@ -28906,11 +28922,19 @@ mod stage3_dma_residue {
         let c0 = ctrl(true, 2, false, false, DREQ_FORCE, 15, 0, false);
         program(&mut bus, 0, 0x2000_0100, 0x2000_0200, 1, c0);
         bus.write32(DMA_BASE + CH_CTRL_TRIG, c0, 0);
-        bus.tick_dma(); // ch0 completes, chains to 15.
+        bus.tick_dma(); // ch0 completes, chains to 15, ch15 fires same tick.
+        // Both destinations populated.
+        assert_eq!(bus.read32(0x2000_0200, 0), 0x1A_1A1A, "ch0 transfer");
+        assert_eq!(bus.read32(0x2000_0400, 0), 0x2B_2B2B, "ch15 transfer");
+        // Both BUSY clear (both completed).
+        let r0 = bus.read32(DMA_BASE + CH_CTRL_TRIG, 0);
         let r15 = bus.read32(DMA_BASE + 15 * 0x40 + CH_CTRL_TRIG, 0);
-        assert_ne!(r15 & CTRL_BUSY, 0, "ch15 must be armed by chain");
-        bus.tick_dma(); // ch15 fires.
-        assert_eq!(bus.read32(0x2000_0400, 0), 0x2B_2B2B);
+        assert_eq!(r0 & CTRL_BUSY, 0, "ch0 BUSY clear");
+        assert_eq!(r15 & CTRL_BUSY, 0, "ch15 BUSY clear");
+        // Both INTR bits latched.
+        let intr = bus.read32(DMA_BASE + REG_INTR, 0);
+        assert_ne!(intr & 1, 0, "ch0 INTR latched");
+        assert_ne!(intr & (1u32 << 15), 0, "ch15 INTR latched");
     }
 
     /// Chain target with `trans_count_reload == 0`: target stays idle

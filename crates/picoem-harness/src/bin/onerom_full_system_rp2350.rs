@@ -19,8 +19,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 
+use picoem_harness::onerom_fixture::FixtureSpec;
 use picoem_harness::{onerom_snapshot_fmt, onerom_sync};
 use rp2350_emu::{Config, EmulatorBuilder};
+
+/// SRAM base where the firmware's `preload_rom_image` DMA would deposit
+/// the shadow buffer on real silicon — and where the smoke harness now
+/// pre-populates a deterministic pattern post-boot-sync. Mirrors
+/// [`crate::onerom_serving_oracle::SHADOW_BASE`].
+const SHADOW_BASE: u32 = 0x2000_0000;
 
 const BOOTROM_PATH: &str = "roms/rp2350/bootrom-combined.bin";
 const FLASH_PATH: &str = "crates/picoem-harness/fixtures/onerom-fire-24-a-rp2350-test-sdrr-0.bin";
@@ -117,6 +124,22 @@ fn main() -> ExitCode {
         "loaded bootrom ({} bytes) and flash ({} bytes)",
         bootrom.len(),
         flash.len()
+    );
+
+    // Parse the fixture metadata so we know `shadow_size` ahead of the
+    // post-sync SHADOW pre-population step. Failure here is fatal — without
+    // the size we can't validate per-push `last_src_addr` ranges.
+    let fixture_spec = match FixtureSpec::from_flash(&flash) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to parse OneROM fixture metadata: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+    println!(
+        "parsed fixture spec: shadow_size = 0x{:X} bytes ({} KiB)",
+        fixture_spec.shadow_size,
+        fixture_spec.shadow_size / 1024
     );
 
     // step_quantum=1 so every emu.run(1) advances exactly one CPU
@@ -220,6 +243,16 @@ fn main() -> ExitCode {
     let mut obs_log: Vec<(u64, u8, u8)> = Vec::new();
     let mut sync_detect_cycle: Option<u64> = None;
 
+    // Per-push-edge log for byte-correctness validation. Each entry records
+    // a CH1 push detected during the observation window:
+    //   (relative cycle, last_src_addr, byte read back from that address)
+    // Populated when `bus.dma_channel_transfer_event(1).push_count`
+    // increments cycle-over-cycle.
+    let mut ch1_push_edges: Vec<(u64, u32, u8)> = Vec::new();
+    // Tracks `push_count` between cycles so we can detect single-cycle
+    // edges. Initialised at sync time below.
+    let mut ch1_push_count_prev: u32 = 0;
+
     while emu.cycles() < BOOT_CYCLE_CAP {
         let before_cycles = emu.cycles();
         emu.run(1).expect("Serial run is infallible");
@@ -313,7 +346,35 @@ fn main() -> ExitCode {
             // single source of truth — the previous glue-DMA prime
             // is no longer required.
             ch1_pushes_at_sync = emu.bus.dma_channel_transfer_event(1).push_count;
+            ch1_push_count_prev = ch1_pushes_at_sync;
             sync_report = Some(report);
+
+            // Pre-populate SHADOW with a deterministic pattern so we can
+            // validate that CH1 reads from the correct address AND returns
+            // the correct byte. The firmware's `preload_rom_image` DMA
+            // does not actually run in EMU today, so without this
+            // population SHADOW would be all zeros and any "stable byte"
+            // observed on D0..D7 cannot be served data — see review
+            // feedback for Stage 7. Pattern: byte = (addr & 0xFF) ^ 0x55.
+            // The XOR ensures we don't confuse it with literal address
+            // bytes; the function is deterministic so the reader can
+            // recompute the expected byte from `last_src_addr` alone.
+            //
+            // Population happens AFTER boot-sync (so we don't race the
+            // firmware's own SRAM writes during init) but BEFORE the
+            // observation window logs any pushes — that's why this lives
+            // in the sync-detect arm, not at start-of-main.
+            let shadow_size = fixture_spec.shadow_size as u32;
+            for offset in 0..shadow_size {
+                let addr = SHADOW_BASE.wrapping_add(offset);
+                let byte = ((addr & 0xFF) ^ 0x55) as u8;
+                emu.bus.write8(addr, byte, 0);
+            }
+            println!(
+                "pre-populated SHADOW [{:#010X}..{:#010X}) with pattern (addr & 0xFF) ^ 0x55",
+                SHADOW_BASE,
+                SHADOW_BASE + shadow_size
+            );
 
             // Install external-input stimulus: CS1 low, CS2/CS3 high,
             // address=0. Using the external-mask override (see the
@@ -345,6 +406,20 @@ fn main() -> ExitCode {
                 ((emu.bus.gpio_in.load(Ordering::Relaxed) >> GPIO_DATA_BASE) & 0xFF) as u8;
             let pio2_drives_data = ((emu.bus.pio[2].pad_oe >> GPIO_DATA_BASE) & 0xFF) as u8;
             obs_log.push((rel_cycle, data_byte, pio2_drives_data));
+
+            // Detect a CH1 push edge: `push_count` is monotonically
+            // increasing per `dma::ChannelTransferEvent`'s reader contract,
+            // so any cycle-over-cycle delta is one or more new pushes.
+            // Capture `last_src_addr` and re-read the SHADOW byte at that
+            // address (SHADOW is immutable post-population, so this is
+            // exactly the byte CH1 fed to PIO2's TX FIFO).
+            let ev = emu.bus.dma_channel_transfer_event(1);
+            if ev.push_count != ch1_push_count_prev {
+                let src = ev.last_src_addr;
+                let byte = emu.bus.read8(src, 0);
+                ch1_push_edges.push((rel_cycle, src, byte));
+                ch1_push_count_prev = ev.push_count;
+            }
 
             if rel_cycle >= POST_SYNC_STIMULUS_CYCLES {
                 println!();
@@ -473,7 +548,13 @@ fn main() -> ExitCode {
         println!("ORACLE DECISION: branch={:?} reason=\"{}\"", branch, reason);
     }
 
-    // F.4: smoke-test verdict on the observation log.
+    // F.4: smoke-test verdict — byte-correctness against the SHADOW
+    // pattern populated at sync. The verdict no longer relies on
+    // sampling the GPIO data bus (that was a liveness check at best,
+    // and "stable 0xFF" was just PIO2's reset-state pad_oe). Instead,
+    // every CH1 push edge captured during the observation window must:
+    //   1. Have `last_src_addr` inside `[SHADOW_BASE, SHADOW_BASE + shadow_size)`
+    //   2. Carry the byte `(last_src_addr & 0xFF) ^ 0x55`
     if !obs_log.is_empty() {
         println!();
         println!(
@@ -489,7 +570,6 @@ fn main() -> ExitCode {
             .dma_channel_transfer_event(1)
             .push_count
             .wrapping_sub(ch1_pushes_at_sync);
-        let verdict = evaluate_smoke_test(&obs_log, ch1_pushes);
         for (cyc, byte, oe) in &obs_log {
             println!(
                 "  rel {:>3}  data=0x{:02X}  pio2_oe=0x{:02X}",
@@ -498,12 +578,32 @@ fn main() -> ExitCode {
         }
         println!();
         println!("  DMA CH1 pushes during observation: {}", ch1_pushes);
-        match verdict {
-            SmokeVerdict::Pass { byte, start, end } => {
+        if !ch1_push_edges.is_empty() {
+            println!(
+                "POST-SYNC CH1 PUSH EDGES ({} edges, columns: rel_cycle src_addr byte_at_src expected):",
+                ch1_push_edges.len()
+            );
+            for (cyc, src, byte) in &ch1_push_edges {
+                let expected = ((src & 0xFF) ^ 0x55) as u8;
                 println!(
-                    "SMOKE TEST PASS — stable byte 0x{:02X} observed on D0..D7 at cycles {}..{} \
-                     (ch1_pushes={})",
-                    byte, start, end, ch1_pushes
+                    "  rel {:>3}  src=0x{:08X}  byte=0x{:02X}  expected=0x{:02X}",
+                    cyc, src, byte, expected
+                );
+            }
+        }
+
+        let verdict = evaluate_smoke_test(
+            &ch1_push_edges,
+            ch1_pushes,
+            SHADOW_BASE,
+            fixture_spec.shadow_size as u32,
+        );
+        match verdict {
+            SmokeVerdict::Pass { edges } => {
+                println!(
+                    "SMOKE TEST PASS — {} CH1 push edges, all from SHADOW range and \
+                     all bytes matched (addr & 0xFF) ^ 0x55 (ch1_pushes={})",
+                    edges, ch1_pushes
                 );
             }
             SmokeVerdict::Fail(reason) => {
@@ -534,90 +634,92 @@ fn main() -> ExitCode {
     }
 }
 
-/// Result of evaluating the post-sync observation log against the
-/// piorom.c timing-envelope oracle.
+/// Result of the byte-correctness smoke test on CH1 push edges.
 enum SmokeVerdict {
-    /// A stable byte was observed on D0..D7 for at least `MIN_STABLE_CYCLES`
-    /// consecutive cycles within the expected 8..30 post-CS window, with
-    /// PIO2 driving all 8 data lanes (pad_oe mask == 0xFF) throughout.
-    Pass {
-        byte: u8,
-        start: u64,
-        end: u64,
-    },
+    /// At least one CH1 push edge was observed, every edge's
+    /// `last_src_addr` was inside the SHADOW range, and every pushed
+    /// byte matched the deterministic pattern `(addr & 0xFF) ^ 0x55`.
+    Pass { edges: usize },
     Fail(String),
 }
 
-/// Smoke test: within relative cycles 8..30, find a ≥ 3-cycle span where
-/// `pio2_drives_data == 0xFF` AND `data_byte` is constant, and verify
-/// that the glue DMA CH1 actually pushed at least one byte into PIO2's
-/// TX FIFO during the observation window.
+/// Smoke verdict: byte-correctness validation on CH1 push edges
+/// captured during the observation window.
 ///
-/// `ch1_pushes` is the count of successful CH1 → PIO2 TX0 pushes since
-/// sync — the `> 0` requirement rules out false positives where the
-/// observed byte is just PIO2's reset state (default `0xFF` on pad_oe).
+/// `push_edges` rows: (relative cycle, last_src_addr, byte read back
+/// from `last_src_addr` at the cycle of the push). SHADOW is populated
+/// at sync time and never written again, so the byte read here is
+/// exactly the byte CH1 fed to PIO2's TX FIFO.
 ///
-/// `obs_log` rows: (relative cycle, data byte on D0..D7, PIO2 pad_oe
-/// over D0..D7).
-fn evaluate_smoke_test(obs_log: &[(u64, u8, u8)], ch1_pushes: u32) -> SmokeVerdict {
-    const MIN_STABLE_CYCLES: usize = 3;
-    const WINDOW_START: u64 = 8;
-    const WINDOW_END: u64 = 30;
-
+/// `ch1_pushes` is the total `push_count` delta over the window —
+/// included for the zero-push fast path so we can give a more useful
+/// diagnostic than "0 edges captured".
+///
+/// PASS criteria:
+///   1. At least one push edge.
+///   2. Every edge's `last_src_addr` ∈ [shadow_base, shadow_base + shadow_size).
+///   3. Every pushed byte equals `((last_src_addr & 0xFF) ^ 0x55) as u8`.
+fn evaluate_smoke_test(
+    push_edges: &[(u64, u32, u8)],
+    ch1_pushes: u32,
+    shadow_base: u32,
+    shadow_size: u32,
+) -> SmokeVerdict {
     if ch1_pushes == 0 {
         return SmokeVerdict::Fail(
-            "DMA never pumped during observation window — glue DMA arming issue. \
-             Any stable byte on D0..D7 would be the PIO2 reset state, not served data."
+            "SMOKE TEST FAIL — DMA CH1 produced 0 pushes during the \
+             observation window. Possible causes:\n  \
+               - Boot-sync occurred but the firmware never armed CH1.\n  \
+               - CH1 paced on a DREQ source that never asserts (PIO1 or \
+             PIO2 SM not pushing data — check FSTAT).\n  \
+               - Per-cycle DMA tick gate (RESETS_RESET bit 2 set, or \
+             Bus::tick_peripherals's needs_tick() short-circuit \
+             misfiring).\n  \
+               - Test hook bug — channel_transfer_event not being \
+             updated by Dma::issue_transfer."
                 .to_string(),
         );
     }
 
-    let window: Vec<&(u64, u8, u8)> = obs_log
-        .iter()
-        .filter(|(c, _, _)| *c >= WINDOW_START && *c <= WINDOW_END)
-        .collect();
-
-    if window.is_empty() {
+    if push_edges.is_empty() {
         return SmokeVerdict::Fail(format!(
-            "observation log does not cover window {}..{} (got {} rows)",
-            WINDOW_START,
-            WINDOW_END,
-            obs_log.len()
+            "ch1_pushes={} but no push edges were captured by the \
+             cycle-by-cycle edge detector. Likely a harness bug: \
+             multiple pushes happened in a single observed cycle and \
+             we sampled `last_src_addr` after the final one. Tighten \
+             the per-cycle detection.",
+            ch1_pushes
         ));
     }
 
-    let mut run_start: Option<usize> = None;
-    let mut run_byte: u8 = 0;
-    for (i, (_, byte, oe)) in window.iter().enumerate() {
-        let drives_all = *oe == 0xFF;
-        match run_start {
-            Some(s) if drives_all && *byte == run_byte => {
-                let len = i - s + 1;
-                if len >= MIN_STABLE_CYCLES {
-                    return SmokeVerdict::Pass {
-                        byte: run_byte,
-                        start: window[s].0,
-                        end: window[i].0,
-                    };
-                }
-            }
-            _ => {
-                if drives_all {
-                    run_start = Some(i);
-                    run_byte = *byte;
-                } else {
-                    run_start = None;
-                }
-            }
+    let shadow_end = shadow_base.wrapping_add(shadow_size);
+    for (cyc, src, byte) in push_edges {
+        if !(*src >= shadow_base && *src < shadow_end) {
+            return SmokeVerdict::Fail(format!(
+                "CH1 push at rel cycle {} read from src=0x{:08X}, which \
+                 is outside SHADOW range [0x{:08X}..0x{:08X}). \
+                 Clue: CH1 is firing but reading from the wrong address \
+                 — possible address-deposit-from-CH0 issue, wrong PIO \
+                 program output, or stale `last_src_addr` from a prior \
+                 transfer.",
+                cyc, src, shadow_base, shadow_end
+            ));
+        }
+        let expected = ((*src & 0xFF) ^ 0x55) as u8;
+        if *byte != expected {
+            return SmokeVerdict::Fail(format!(
+                "CH1 push at rel cycle {} from src=0x{:08X} returned \
+                 byte=0x{:02X}, expected=0x{:02X}. Clue: CH1 is reading \
+                 the right address but the byte came back wrong — \
+                 possible SHADOW corruption (something else is writing \
+                 to the populated range) or a wrong-byte-lane bug in \
+                 the DMA read path.",
+                cyc, src, byte, expected
+            ));
         }
     }
 
-    SmokeVerdict::Fail(format!(
-        "no {}-cycle stable byte with PIO2 driving all D0..D7 lanes in window {}..{}; \
-         max pio2_oe seen = 0x{:02X}",
-        MIN_STABLE_CYCLES,
-        WINDOW_START,
-        WINDOW_END,
-        window.iter().map(|(_, _, oe)| *oe).max().unwrap_or(0),
-    ))
+    SmokeVerdict::Pass {
+        edges: push_edges.len(),
+    }
 }
