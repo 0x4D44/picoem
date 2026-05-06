@@ -3874,6 +3874,169 @@ mod tests {
         pio.write32(0x034, 0xAA, 1);
         assert_eq!(pio.irq_flags, 0xAA, "IRQ_FORCE OR-only regardless of alias");
     }
+
+    // -------------------------------------------------------------------
+    // stage9_residue — second-pass coverage for write_ctrl
+    // SM_RESTART/CLKDIV_RESTART loops, write_sm_reg out-of-range
+    // dispatch, and the apply_fifo_join post-write reconfigure path.
+    // -------------------------------------------------------------------
+
+    /// `write_ctrl` SM_RESTART (bits [7:4]) clears per-SM execution state
+    /// for each SM whose bit is set. Drives the line ~1016 inner-loop
+    /// `if (sm_restart_bits >> i) & 1 != 0` true arm for SM0 and the
+    /// false arm for SM1..3 (single-bit restart, not all-1s).
+    #[test]
+    fn write_ctrl_sm_restart_clears_only_selected_sm() {
+        let mut pio = PioBlock::new();
+        // Stage some non-default state on SM0 and SM1.
+        pio.sm[0].pc = 7;
+        pio.sm[0].x = 0xDEAD_BEEF;
+        pio.sm[0].y = 0x1234_5678;
+        pio.sm[0].isr = 0xFFFF_FFFF;
+        pio.sm[0].isr_count = 16;
+        pio.sm[1].pc = 3;
+        pio.sm[1].x = 0xCAFE_BABE;
+        pio.sm[1].isr_count = 8;
+
+        // CTRL: SM_RESTART bit for SM0 only (bit 4).
+        pio.write32(0x000, 1u32 << 4, 0);
+
+        // SM0 fully reset.
+        assert_eq!(pio.sm[0].pc, 0, "SM0 pc must reset");
+        assert_eq!(pio.sm[0].x, 0, "SM0 x must reset");
+        assert_eq!(pio.sm[0].y, 0, "SM0 y must reset");
+        assert_eq!(pio.sm[0].isr, 0, "SM0 isr must reset");
+        assert_eq!(pio.sm[0].isr_count, 0, "SM0 isr_count must reset");
+        assert_eq!(pio.sm[0].osr_count, 32, "SM0 osr_count must reset to 32");
+
+        // SM1 untouched (the false arm of the inner loop).
+        assert_eq!(pio.sm[1].pc, 3, "SM1 pc must be untouched");
+        assert_eq!(pio.sm[1].x, 0xCAFE_BABE, "SM1 x must be untouched");
+        assert_eq!(pio.sm[1].isr_count, 8, "SM1 isr_count must be untouched");
+    }
+
+    /// `write_ctrl` CLKDIV_RESTART (bits [11:8]) clears each SM's
+    /// `clkdiv_acc` for selected SMs. Drives the line ~1033 inner-loop
+    /// `if (clkdiv_restart_bits >> i) & 1 != 0` true arm with a single-
+    /// bit-set value so the false arm fires for the other SMs.
+    #[test]
+    fn write_ctrl_clkdiv_restart_resets_only_selected_sm() {
+        let mut pio = PioBlock::new();
+        pio.sm[0].clkdiv_acc = 0x1234_5678;
+        pio.sm[2].clkdiv_acc = 0xAAAA_5555;
+
+        // CTRL: CLKDIV_RESTART bit for SM2 only (bit 10).
+        pio.write32(0x000, 1u32 << 10, 0);
+
+        assert_eq!(pio.sm[2].clkdiv_acc, 0, "SM2 clkdiv_acc must reset");
+        assert_eq!(
+            pio.sm[0].clkdiv_acc, 0x1234_5678,
+            "SM0 clkdiv_acc must be untouched"
+        );
+    }
+
+    /// `write_sm_reg` early-returns when the offset translates to an SM
+    /// index >= 4. The arithmetic `sm_offset / 0x18` for offset 0x120
+    /// (just past SM3's last register) yields sm_idx = 4, which is
+    /// out of bounds — drives the line ~875 `if sm_idx >= 4 { return; }`
+    /// true arm. We verify silence (no panic, no state change).
+    #[test]
+    fn write_sm_reg_out_of_range_offset_is_noop() {
+        let mut pio = PioBlock::new();
+        // Snapshot SM3 state since 0x120 is closer to SM3's window.
+        let pre_clkdiv = pio.sm[3].read_clkdiv();
+        let pre_pc = pio.sm[3].pc;
+
+        // 0x120 falls in the per-SM range gate (0x0C8..=0x127) but
+        // sm_offset = 0x120 - 0x0C8 = 0x58, sm_idx = 0x58 / 0x18 = 3 (sigh — yes 3).
+        // To genuinely hit sm_idx >= 4 we'd need offset 0xE0+ (0xE0 -
+        // 0xC8 = 0x18, that's idx=1; 0x120 - 0xC8 = 0x58, idx=3; the
+        // top of the gate is 0x127 → 0x5F → idx=3. The branch's true
+        // arm IS architecturally unreachable from the bus dispatch,
+        // but we drive `write_sm_reg` directly to confirm the guard
+        // fires safely.
+        pio.write_sm_reg(0x0C8 + (4 * 0x18), 0xFFFF_FFFF, 0);
+
+        assert_eq!(pio.sm[3].read_clkdiv(), pre_clkdiv);
+        assert_eq!(pio.sm[3].pc, pre_pc);
+    }
+
+    /// `read_sm_reg` early-returns 0 for an out-of-range offset that
+    /// would index sm[4] or beyond. Mirror of `write_sm_reg_out_of_range`
+    /// for the read path's line ~839 `if sm_idx >= 4 { return 0; }` arm.
+    #[test]
+    fn read_sm_reg_out_of_range_offset_returns_zero() {
+        let pio = PioBlock::new();
+        // Drive read_sm_reg directly past SM3.
+        let v = pio.read_sm_reg(0x0C8 + (4 * 0x18));
+        assert_eq!(v, 0, "out-of-range SM read must return 0");
+    }
+
+    /// SHIFTCTRL alias-write that flips the FJOIN bits triggers a
+    /// FIFO-join reconfigure. Drives the line ~902 `if old_join !=
+    /// new_join { self.apply_fifo_join(sm_idx); }` true arm. Pre: SM0
+    /// at default (depth=4 for both); post: write SHIFTCTRL with bit
+    /// 30 set (FJOIN_TX), expect SM0.tx_fifo depth=8 / rx_fifo depth=0.
+    #[test]
+    fn shiftctrl_fjoin_flip_reconfigures_fifo_depth() {
+        let mut pio = PioBlock::new();
+        // Default depths (per StateMachine::new + apply_fifo_join in
+        // PioBlock::new): tx=4, rx=4.
+        let pre_tx_full_at = {
+            let mut count = 0;
+            for v in 0..u32::MAX {
+                if !pio.sm[0].tx_fifo.push(v) {
+                    break;
+                }
+                count += 1;
+            }
+            count
+        };
+        assert_eq!(pre_tx_full_at, 4, "default tx_fifo depth=4");
+
+        // Reset by re-creating; then write SHIFTCTRL with FJOIN_TX (bit 30).
+        let mut pio = PioBlock::new();
+        // SM0 SHIFTCTRL is at offset 0x0D0. Plain write of 1<<30.
+        pio.write32(0x0D0, 1u32 << 30, 0);
+
+        // Now the tx_fifo should accept 8 pushes.
+        let mut pushes_ok = 0;
+        for v in 0..16u32 {
+            if !pio.sm[0].tx_fifo.push(v) {
+                break;
+            }
+            pushes_ok += 1;
+        }
+        assert_eq!(pushes_ok, 8, "FJOIN_TX must extend tx depth to 8");
+    }
+
+    /// SHIFTCTRL alias-write that does NOT flip FJOIN keeps the FIFO
+    /// depths unchanged — drives the false arm of line ~902. Pre-stage
+    /// FJOIN_TX, then issue another SHIFTCTRL write that touches a
+    /// non-FJOIN bit (PUSH_THRESH, bits [29:25]). The reconfigure path
+    /// should NOT fire (the join bits are unchanged), so tx remains
+    /// at depth 8.
+    #[test]
+    fn shiftctrl_non_fjoin_write_does_not_reconfigure_fifo() {
+        let mut pio = PioBlock::new();
+        // Stage FJOIN_TX.
+        pio.write32(0x0D0, 1u32 << 30, 0);
+        // Now issue a SET-alias write of PUSH_THRESH (bits 29:25 = 0x1F).
+        // Alias=2 (SET/OR) leaves bit 30 untouched.
+        pio.write32(0x0D0, 0x1F << 25, 2);
+
+        let mut pushes_ok = 0;
+        for v in 0..16u32 {
+            if !pio.sm[0].tx_fifo.push(v) {
+                break;
+            }
+            pushes_ok += 1;
+        }
+        assert_eq!(
+            pushes_ok, 8,
+            "non-FJOIN write must not reconfigure tx_fifo depth"
+        );
+    }
 }
 
 // Public-facing helper used by the branch-coverage tests above to drive

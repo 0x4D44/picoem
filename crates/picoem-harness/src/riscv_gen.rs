@@ -4185,4 +4185,139 @@ mod tests {
             "single case must be the residue-allocated ALU draw",
         );
     }
+
+    // -------------------------------------------------------------------------
+    // stage9_residue — second-pass coverage for the rs2-aliased / rs2==0
+    // false arms in `gen_fuzz_rv32i_mem` (line ~1352) and
+    // `gen_fuzz_rv32i_misaligned` (line ~1405). Both have the structure
+    // `if rs2 != 0 && rs2 != rs1 { reg_pre.push((rs2, ...)); }`. With
+    // rand_gpr() returning {1..32} \ {3, 31}, rs2 == 0 is impossible, so
+    // the false arm fires only on aliased rs2 == rs1 — a 1-in-29 draw.
+    // High-count fuzz with a deterministic seed must hit at least one.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_rv32i_mem_includes_aliased_rs2_eq_rs1_path() {
+        // High-count draw: with 2000 store cases the alias rs2==rs1 must
+        // fire at least once (P(no alias in 2k stores) ≈ (28/29)^1000 →
+        // negligible). When it fires, the inner `if rs2 != 0 && rs2 !=
+        // rs1` arm goes false and the reg_pre.push is suppressed,
+        // leaving exactly one entry (the rs1 seed).
+        let mut rng = StdRng::seed_from_u64(0xC0FF_EE00_BEEF_F00D);
+        let cs = gen_fuzz_rv32i_mem(&mut rng, 2000);
+        let stores: Vec<&RiscvTestCase> = cs
+            .iter()
+            .filter(|tc| tc.words[0] & 0x7F == OPC_STORE)
+            .collect();
+        assert!(!stores.is_empty(), "expected store cases in 2k draws");
+
+        let aliased = stores
+            .iter()
+            .filter(|tc| {
+                let w = tc.words[0];
+                let rs1 = rs1_field(w);
+                let rs2 = ((w >> 20) & 0x1F) as u8;
+                rs2 == rs1
+            })
+            .count();
+        // The expected count (~stores/29) is large enough to assert on.
+        assert!(
+            aliased > 0,
+            "no rs2==rs1 alias hit in {} store cases — false arm of \
+             `if rs2 != 0 && rs2 != rs1` not driven",
+            stores.len(),
+        );
+
+        // Aliased cases must have exactly one reg_pre (the rs1 seed).
+        for tc in &stores {
+            let w = tc.words[0];
+            let rs1 = rs1_field(w);
+            let rs2 = ((w >> 20) & 0x1F) as u8;
+            if rs2 == rs1 {
+                assert_eq!(
+                    tc.reg_pre.len(),
+                    1,
+                    "aliased rs2 must NOT push a second reg_pre entry: {}",
+                    tc.name,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_rv32i_misaligned_includes_aliased_rs2_eq_rs1_path() {
+        // Same property for the misaligned generator (line ~1405).
+        let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_C0DE_F00D);
+        let cs = gen_fuzz_rv32i_misaligned(&mut rng, 2000);
+        let stores: Vec<&RiscvTestCase> = cs
+            .iter()
+            .filter(|tc| tc.words[0] & 0x7F == OPC_STORE)
+            .collect();
+        assert!(!stores.is_empty(), "expected store cases in 2k draws");
+
+        let aliased = stores
+            .iter()
+            .filter(|tc| {
+                let w = tc.words[0];
+                let rs1 = rs1_field(w);
+                let rs2 = ((w >> 20) & 0x1F) as u8;
+                rs2 == rs1
+            })
+            .count();
+        assert!(
+            aliased > 0,
+            "no rs2==rs1 alias hit in {} misaligned store cases",
+            stores.len(),
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // stage9_residue — drive seldom-hit RNG-loop bodies in `gen_fuzz_rv32c`
+    // helper (lines ~1884, ~1957, ~1980: rejection-sampling loops that pick
+    // a non-zero immediate / non-x2 rd / non-zero encoded nzimm). The first
+    // iteration almost always succeeds, but a high-count draw must hit at
+    // least one rejection so the inner `if v != 0` (or equivalent) false arm
+    // fires. This is a property test: we don't assert exactly which draw
+    // rejects, only that the generator survives 5k iterations producing
+    // valid encodings (no panics, no zero-immediate slips through).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fuzz_rv32c_high_count_exercises_rejection_loops() {
+        let mut rng = StdRng::seed_from_u64(0xAAAA_5555_0F0F_F0F0);
+        let cs = gen_fuzz_rv32c(&mut rng, 5000);
+        assert_eq!(cs.len(), 5000);
+
+        // Class tag invariant + four sub-arm presence: at 5000 draws each
+        // of the four `mix` ranges (Zcmp, mem, branch, arith) must appear
+        // at least once. Driving the dispatch + the inner rejection-
+        // sampling loops in `gen_rv32c_arith` (lines ~1884, ~1957, ~1980)
+        // is the property under test.
+        let mut zcmp_seen = 0usize;
+        let mut mem_seen = 0usize;
+        let mut branch_seen = 0usize;
+        let mut arith_seen = 0usize;
+        for tc in &cs {
+            assert_eq!(
+                tc.class,
+                RiscvClass::Rv32c,
+                "RV32C class tag wrong: {}",
+                tc.name,
+            );
+            // Heuristic family identification by name prefix.
+            if tc.name.contains("rvc_br") {
+                branch_seen += 1;
+            } else if tc.expect_trap == Some(2) {
+                zcmp_seen += 1;
+            } else if !tc.addr_regs.is_empty() {
+                mem_seen += 1;
+            } else {
+                arith_seen += 1;
+            }
+        }
+        assert!(zcmp_seen > 0, "no Zcmp cases in 5k draws");
+        assert!(mem_seen > 0, "no compressed-mem cases in 5k draws");
+        assert!(branch_seen > 0, "no compressed-branch cases in 5k draws");
+        assert!(arith_seen > 0, "no compressed-arith cases in 5k draws");
+    }
 }

@@ -8985,4 +8985,62 @@ mod stage4_harness_residue {
         // derive(Copy, Clone) glue-code branches.
         assert_eq!(c, FuzzClass::Base);
     }
+
+    // -------------------------------------------------------------------
+    // stage9_residue — direct drives of `cond_passes` boolean-operator
+    // arms (lib.rs:4080-4085) that the IT-block fuzz path doesn't reach
+    // because flags_condition_true/false yield only specific flag combos.
+    //
+    // The `&&` / `||` short-circuit operators each contribute two
+    // branches (LHS true vs false controls whether RHS evaluates). These
+    // tests force both arms by direct call.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn cond_passes_hi_short_circuits_on_c() {
+        // HI (cond 8): c && !z. C=0 → short-circuits to false without
+        // looking at Z. C=1, Z=1 → false. C=1, Z=0 → true.
+        let c_only = 0x2000_0000u32; // C=1
+        let z_only = 0x4000_0000u32; // Z=1
+        assert!(!cond_passes(8, 0), "C=0 → HI false (LHS short-circuit)");
+        assert!(!cond_passes(8, c_only | z_only), "C=1 Z=1 → HI false");
+        assert!(cond_passes(8, c_only), "C=1 Z=0 → HI true");
+    }
+
+    #[test]
+    fn cond_passes_ls_short_circuits_on_not_c() {
+        // LS (cond 9): !c || z. C=0 → short-circuits to true without
+        // looking at Z. C=1, Z=0 → false. C=1, Z=1 → true via the RHS.
+        let c_only = 0x2000_0000u32;
+        let z_only = 0x4000_0000u32;
+        assert!(cond_passes(9, 0), "C=0 → LS true (LHS short-circuit)");
+        assert!(!cond_passes(9, c_only), "C=1 Z=0 → LS false");
+        assert!(cond_passes(9, c_only | z_only), "C=1 Z=1 → LS true via RHS");
+    }
+
+    #[test]
+    fn cond_passes_gt_short_circuits_on_z() {
+        // GT (cond 12): !z && (n == v). Z=1 → short-circuits to false.
+        // Z=0, N==V → true. Z=0, N!=V → false.
+        let n = 0x8000_0000u32;
+        let v = 0x1000_0000u32;
+        let z = 0x4000_0000u32;
+        assert!(!cond_passes(12, z), "Z=1 → GT false (LHS short-circuit)");
+        assert!(cond_passes(12, 0), "Z=0 N=0 V=0 → GT true");
+        assert!(cond_passes(12, n | v), "Z=0 N=1 V=1 → GT true");
+        assert!(!cond_passes(12, n), "Z=0 N=1 V=0 → GT false");
+    }
+
+    #[test]
+    fn cond_passes_le_short_circuits_on_z() {
+        // LE (cond 13): z || (n != v). Z=1 → short-circuits to true.
+        // Z=0, N!=V → true. Z=0, N==V → false.
+        let n = 0x8000_0000u32;
+        let v = 0x1000_0000u32;
+        let z = 0x4000_0000u32;
+        assert!(cond_passes(13, z), "Z=1 → LE true (LHS short-circuit)");
+        assert!(!cond_passes(13, 0), "Z=0 N=0 V=0 → LE false");
+        assert!(cond_passes(13, n), "Z=0 N=1 V=0 → LE true via RHS");
+        assert!(cond_passes(13, v), "Z=0 N=0 V=1 → LE true via RHS");
+    }
 }

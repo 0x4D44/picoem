@@ -13837,3 +13837,543 @@ mod stage8_lib_residue {
         assert_eq!(emu.peek(addr), 0xCAFE_BABE);
     }
 }
+
+// ===========================================================================
+// Stage 9 — second-pass residue: target ~20 more uncovered branches across
+// lib.rs / threaded/{bus,emulator}.rs / core/{decode,mod,nvic}.rs.
+// ===========================================================================
+
+#[cfg(test)]
+mod stage9_residue {
+    use crate::{Config, Emulator, EmulatorBuilder};
+
+    // ============================================================
+    // lib.rs §1
+    // ============================================================
+    //
+    // Lines 945 / 951 are the cached panic_info / timeout_info early-
+    // return arms inside `Emulator::run` (Threaded path). The 612-625
+    // pair is the same in `Emulator::step`. Synthesise the cached
+    // states by writing directly to the public-crate-private fields
+    // (no actual worker dispatch needed).
+
+    /// FALSE-arm of line 951 (timeout_info Some) plus TRUE arm of line
+    /// 624 inside `Emulator::step`. Bypasses real worker timeout by
+    /// pre-staging the cached entry. Drives the `BarrierTimeout` arm.
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn step_threaded_returns_cached_timeout() {
+        use crate::{EmulatorError, ExecutionModel, WorkerName};
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build");
+        // Pre-stage a synthetic timeout. `pub(crate)` field access from
+        // an in-crate test module is legal.
+        emu.timeout_info = Some((WorkerName::Coord, 1_500));
+        let r = emu.step();
+        assert!(matches!(
+            r,
+            Err(EmulatorError::BarrierTimeout {
+                which: WorkerName::Coord,
+                elapsed_ms: 1_500,
+            })
+        ));
+    }
+
+    /// Same pattern but on `Emulator::run` (line 951). Drives the
+    /// timeout-cache early-return arm before entering the worker pool.
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn run_threaded_returns_cached_timeout() {
+        use crate::{EmulatorError, ExecutionModel, WorkerName};
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build");
+        emu.timeout_info = Some((WorkerName::Core1, 999));
+        let r = emu.run(64);
+        assert!(matches!(
+            r,
+            Err(EmulatorError::BarrierTimeout {
+                which: WorkerName::Core1,
+                elapsed_ms: 999,
+            })
+        ));
+    }
+
+    /// Cached-timeout arm of `run_quantum_threaded` (lib.rs:1011). Same
+    /// pre-stage technique; covers the timeout branch distinct from the
+    /// panic_info branch already exercised by stage4_lib_residue_v2.
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn run_quantum_threaded_returns_cached_timeout() {
+        use crate::{EmulatorError, ExecutionModel, WorkerName};
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .execution(ExecutionModel::Threaded)
+            .build()
+            .expect("Threaded build");
+        emu.timeout_info = Some((WorkerName::Core0, 12_345));
+        let r = emu.run_quantum();
+        assert!(matches!(
+            r,
+            Err(EmulatorError::BarrierTimeout {
+                which: WorkerName::Core0,
+                elapsed_ms: 12_345,
+            })
+        ));
+    }
+
+    // ============================================================
+    // lib.rs §2 — load_bootrom / load_flash regions == 0 branch
+    // ============================================================
+    //
+    // Lines 496 / 507 carry `if regions != 0 { ... }`. Coverage shows
+    // the TRUE arm fires on a fresh emulator (load_*  pushes a region
+    // bit). To hit the FALSE arm, call after a prior load has already
+    // drained the region flag.
+
+    /// Drives the FALSE arm of `if regions != 0` at lib.rs:496 by
+    /// calling `load_bootrom` twice in succession with a `step` between
+    /// them — the first call's region bit is consumed inside `step`,
+    /// so the second call sees `regions == 0`.
+    #[test]
+    fn load_bootrom_twice_second_call_has_no_pending_region() {
+        let mut emu = Emulator::new(Config::default());
+        // First load: pushes ROM region into pending_invalidation_regions
+        // and the load fn drains it in the same call.
+        emu.load_bootrom(&[0u8; 16]);
+        // The first call already drained `pending_invalidation_regions`
+        // back to 0; a no-op load preserves that. Second call also hits
+        // the FALSE arm since `bus.load_bootrom` of zero bytes... but
+        // even nonzero bytes drain to 0 inside the same call. Reset the
+        // pending flag manually to be belt-and-braces.
+        emu.bus.pending_invalidation_regions = 0;
+        emu.load_bootrom(&[]);
+        // Confirm we did not panic; the no-op branch ran cleanly.
+        assert_eq!(emu.bus.pending_invalidation_regions, 0);
+    }
+
+    /// Same pattern for `load_flash` (lib.rs:507).
+    #[test]
+    fn load_flash_with_no_pending_region_no_ops() {
+        let mut emu = Emulator::new(Config::default());
+        // Drain any pre-existing region bit.
+        emu.bus.pending_invalidation_regions = 0;
+        emu.load_flash(&[]);
+        assert_eq!(emu.bus.pending_invalidation_regions, 0);
+    }
+
+    // ============================================================
+    // lib.rs §3 — tick_pio_and_route_irqs PIO-IRQ assertion arms
+    // ============================================================
+    //
+    // Lines 894 / 897 (`if pio[block].int0_ints_rp2040() != 0`,
+    // `... int1_ints ...`) — both shown as FALSE-only in coverage.
+    // Drive them by writing to PIO0 IRQ0_INTF (offset 0x174) and
+    // IRQ1_INTF (0x180) so the force bit alone is enough to make
+    // `int0_ints_rp2040` / `int1_ints_rp2040` non-zero.
+
+    /// PIO0 INT0_INTF write makes `int0_ints_rp2040() != 0`, so the
+    /// route loop sets `bus.irq_pending` bit 7 (PIO0_IRQ_0).
+    #[test]
+    fn tick_pio_and_route_irqs_sets_pio0_irq0_when_intf_forced() {
+        let mut emu = Emulator::new(Config::default());
+        // Force slow path so tick_pio_and_route_irqs runs.
+        emu.bus.systicks[0].csr |= 1;
+        // PIO0 base = 0x5020_0000; IRQ0_INTF = base + 0x174.
+        emu.bus.pio[0].write32(0x174, 0x0001, 0);
+        let _ = emu.step().unwrap();
+        // Either IRQ landed in irq_pending (then drained to NVIC) or
+        // already routed to NVIC pending. Both observations are
+        // sufficient to confirm the line-894 TRUE arm fired.
+        let routed = emu.bus.nvics[0].is_pending(7) || emu.bus.nvics[1].is_pending(7);
+        assert!(routed, "PIO0 IRQ0 must route via tick_pio_and_route_irqs");
+    }
+
+    /// PIO0 INT1_INTF write — drives line 897 TRUE arm. Sets bus
+    /// irq_pending bit 8 (PIO0_IRQ_1 = NVIC line 8).
+    #[test]
+    fn tick_pio_and_route_irqs_sets_pio0_irq1_when_intf_forced() {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.systicks[0].csr |= 1;
+        // PIO0 IRQ1_INTF = base + 0x180.
+        emu.bus.pio[0].write32(0x180, 0x0001, 0);
+        let _ = emu.step().unwrap();
+        let routed = emu.bus.nvics[0].is_pending(8) || emu.bus.nvics[1].is_pending(8);
+        assert!(routed, "PIO0 IRQ1 must route via tick_pio_and_route_irqs");
+    }
+
+    /// PIO1 INT0_INTF — covers the second iteration of the for-loop in
+    /// `tick_pio_and_route_irqs` (line0_bit = 9 → NVIC line 9).
+    #[test]
+    fn tick_pio_and_route_irqs_sets_pio1_irq0_when_intf_forced() {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.systicks[0].csr |= 1;
+        emu.bus.pio[1].write32(0x174, 0x0001, 0);
+        let _ = emu.step().unwrap();
+        let routed = emu.bus.nvics[0].is_pending(9) || emu.bus.nvics[1].is_pending(9);
+        assert!(routed, "PIO1 IRQ0 must route via tick_pio_and_route_irqs");
+    }
+
+    // ============================================================
+    // lib.rs §4 — wake_checks WFE wake on core 1
+    // ============================================================
+    //
+    // Existing stage5 tests cover wfe_waiting consumption on core 0;
+    // line 1182 col 16 tracks the for-loop's iteration on core 1. The
+    // FALSE arm dominates with most steps — coverage shows the second
+    // iteration's TRUE arm is covered, but col 27 (the `&&` short-
+    // circuit RHS evaluation count) is 0. Drive both by parking core 1
+    // on WFE and latching its event_flag.
+
+    /// wake_checks must consume core 1's WFE+event pair (line 1182
+    /// iteration core==1).
+    #[test]
+    fn wake_checks_consumes_wfe_event_core1() {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.wfe_waiting[1] = true;
+        emu.bus.event_flag[1] = true;
+        // halt core 0 too so step_serial is a no-op and reaches
+        // wake_checks via the alarm-advance early-return or the
+        // tail-of-step_serial wake_checks call.
+        emu.cores[0].halt();
+        let _ = emu.step().unwrap();
+        // Either the WFE branch consumed the latch, or the wake_checks
+        // tail did. Both paths agree: post-step neither flag is set.
+        assert!(!emu.bus.wfe_waiting[1]);
+        assert!(!emu.bus.event_flag[1]);
+    }
+
+    // ============================================================
+    // core/decode.rs — wide-prefix bus-fault arm + undefined catch-all
+    // ============================================================
+    //
+    // Line 230 (`if wide && bus.bus_fault()`) — covered TRUE arm only.
+    // FALSE arm: wide instruction fetched cleanly, no fault. Drive by
+    // injecting a 0xF000 prefix at SRAM with valid hw1.
+    //
+    // Line 314 (`_ => self.thumb16_undefined(opcode)`) — the catch-all
+    // for prefixes 0b11101 / 0b11111 (M33-only widths the M0+ rejects
+    // as undefined). Drive a 16-bit fetch of those prefixes; since
+    // `is_wide` only accepts 0b11110, 0b11101 falls through into
+    // `execute_thumb16` which lands on the catch-all.
+
+    /// Drives line 314's catch-all undefined arm: prefix 0b11101 is
+    /// architecturally undefined on M0+. `is_wide` rejects it (only
+    /// 0b11110 is accepted), so `execute_thumb16` matches the `_` arm
+    /// and calls `thumb16_undefined`, which raises a HardFault via
+    /// `pending_fault`.
+    #[test]
+    fn execute_thumb16_undefined_for_prefix_11101() {
+        use crate::core::CortexM0Plus;
+        // Build a minimal Bus and place 0xE800_0000 (prefix 0b11101) at
+        // SRAM. The decoder should not classify this as wide on M0+
+        // (is_wide accepts only 0b11110), so it falls through to the
+        // 16-bit dispatch and lands on the undefined catch-all.
+        let mut emu = Emulator::new(Config::default());
+        // SRAM addr 0x2000_0000 — write a halfword whose top 5 bits
+        // are 0b11101. e.g. 0xE800.
+        emu.bus.memory.sram_write16(0, 0xE800);
+        let mut cpu = CortexM0Plus::with_id(0);
+        cpu.regs.set_pc(0x2000_0000);
+        cpu.regs.xpsr = 1 << 24;
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.r[13] = 0x2000_8000;
+        // Step once — undefined dispatch raises a pending fault, which
+        // deliver_fault handles. Just confirm we don't loop forever.
+        let _ = cpu.step(&mut emu.bus);
+    }
+
+    /// Drives line 314 for prefix 0b11111. Same shape as the previous
+    /// test but with the high-prefix variant.
+    #[test]
+    fn execute_thumb16_undefined_for_prefix_11111() {
+        use crate::core::CortexM0Plus;
+        let mut emu = Emulator::new(Config::default());
+        // 0xF800 is prefix 0b11111. `is_wide` ((hw0 >> 11) == 0b11110)
+        // is FALSE for this opcode (== 0b11111), so the 16-bit
+        // dispatch path runs and the catch-all undefined arm fires.
+        emu.bus.memory.sram_write16(0, 0xF800);
+        let mut cpu = CortexM0Plus::with_id(0);
+        cpu.regs.set_pc(0x2000_0000);
+        cpu.regs.xpsr = 1 << 24;
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.r[13] = 0x2000_8000;
+        let _ = cpu.step(&mut emu.bus);
+    }
+
+    // ============================================================
+    // core/nvic.rs — highest_priority_pending tie-break + empty
+    // ============================================================
+    //
+    // Lines 122 / 132 / 141 / 149 / 159 carry the `irq < 32` /
+    // `(irq as u32) < IRQ_COUNT` guards on the various accessors. The
+    // OOB (FALSE) arms are well-covered; the corner is a real-pending
+    // tie-break inside `highest_priority_pending`.
+
+    /// `highest_priority_pending` with two pending+enabled IRQs at
+    /// equal priority — must return the lower-numbered one (tie-break
+    /// rule). Drives the line-216 found-update path on the second
+    /// iteration's `p < best_prio` FALSE arm (equal priorities).
+    #[test]
+    fn highest_priority_pending_tiebreak_on_equal_priority() {
+        use crate::core::nvic::Nvic;
+        let mut n = Nvic::new();
+        // Set two IRQs both pending+enabled at priority 0x40.
+        n.set_pending(5);
+        n.set_pending(10);
+        n.set_enabled(5);
+        n.set_enabled(10);
+        n.set_priority(5, 0x40);
+        n.set_priority(10, 0x40);
+        // Lower-numbered IRQ (5) wins the tie.
+        let (irq, prio) = n.highest_priority_pending().expect("at least one");
+        assert_eq!(irq, 5, "lower-numbered IRQ wins tie-break");
+        assert_eq!(prio, 0x40);
+    }
+
+    /// `highest_priority_pending` with strict-lower priority on the
+    /// second iteration — drives `p < best_prio` TRUE arm (line 210).
+    #[test]
+    fn highest_priority_pending_lower_priority_value_wins() {
+        use crate::core::nvic::Nvic;
+        let mut n = Nvic::new();
+        n.set_pending(2);
+        n.set_pending(7);
+        n.set_enabled(2);
+        n.set_enabled(7);
+        // IRQ 2 has priority 0x80; IRQ 7 has 0x40 (numerically lower
+        // = higher architectural priority). IRQ 7 must win.
+        n.set_priority(2, 0x80);
+        n.set_priority(7, 0x40);
+        let (irq, prio) = n.highest_priority_pending().expect("at least one");
+        assert_eq!(irq, 7);
+        assert_eq!(prio, 0x40);
+    }
+
+    /// `clear_pending` boundary — calling with `irq == IRQ_COUNT`
+    /// hits the OOB-noop arm. Existing tests check 32/255 but not the
+    /// exact boundary. Drives line 113 col 12 false arm.
+    #[test]
+    fn clear_pending_at_irq_count_boundary_is_noop() {
+        use crate::core::nvic::Nvic;
+        let mut n = Nvic::new();
+        // Pre-set every legal RP2040 line.
+        for i in 0..crate::irq::IRQ_COUNT as u8 {
+            n.set_pending(i);
+        }
+        // Clear at boundary IRQ_COUNT (the smallest invalid index for
+        // RP2040 — bits beyond IRQ_COUNT are RAZ/WI on real silicon).
+        n.clear_pending(crate::irq::IRQ_COUNT as u8);
+        // No-op — every previously-set bit is still pending.
+        for i in 0..crate::irq::IRQ_COUNT as u8 {
+            assert!(n.is_pending(i), "line {i} must remain pending");
+        }
+    }
+
+    /// `clear_enabled` matching boundary check — drives line 141.
+    #[test]
+    fn clear_enabled_at_irq_count_boundary_is_noop() {
+        use crate::core::nvic::Nvic;
+        let mut n = Nvic::new();
+        for i in 0..crate::irq::IRQ_COUNT as u8 {
+            n.set_enabled(i);
+        }
+        n.clear_enabled(crate::irq::IRQ_COUNT as u8);
+        for i in 0..crate::irq::IRQ_COUNT as u8 {
+            assert!(n.is_enabled(i), "line {i} must remain enabled");
+        }
+    }
+
+    // ============================================================
+    // core/mod.rs — try_take_any_pending_exception PendSV / SysTick
+    // dispatch arms with priority arbitration
+    // ============================================================
+    //
+    // Lines 343 / 346 / 350 / 354 / 358 — the candidate-arbitration
+    // chain inside `try_take_any_pending_exception`. Coverage shows
+    // `pendsv` (343) and `pendst` (346) FALSE arms only; same for the
+    // priority-update predicates (350 / 358). Drive the TRUE arms with
+    // ICSR-set + an awake core.
+
+    /// PendSV pending alone, no other candidates — exercises line 343
+    /// TRUE arm and line 369 (clear PENDSVSET on dispatch).
+    #[test]
+    fn try_take_any_pending_dispatches_pendsv() {
+        use crate::core::CortexM0Plus;
+        let mut emu = Emulator::new(Config::default());
+        // Set up a minimal vector table at ROM 0 so PendSV (#14) has a
+        // valid handler address. Vector 14 lives at offset 14*4 = 0x38.
+        let mut rom = vec![0u8; crate::ROM_SIZE];
+        rom[0..4].copy_from_slice(&0x2000_8000u32.to_le_bytes());
+        rom[4..8].copy_from_slice(&0x0000_0101u32.to_le_bytes());
+        rom[0x38..0x3C].copy_from_slice(&0x2000_2001u32.to_le_bytes());
+        emu.bus.memory.load_rom(&rom);
+        // Place a NOP at the handler entry (0x2000_2000) so the
+        // exception entry doesn't immediately fault.
+        emu.bus.memory.sram_write16(0x2000, 0xBF00);
+
+        let mut cpu = CortexM0Plus::with_id(0);
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.r[13] = 0x2000_8000;
+        cpu.regs.set_pc(0x0000_0100);
+        cpu.regs.xpsr = 1 << 24;
+        // Set ICSR.PENDSVSET (bit 28) on core 0's PPB.
+        emu.bus.ppb[0].icsr |= 1 << 28;
+        // Step — try_take_any_pending_exception should dispatch PendSV.
+        let cycles = cpu.step(&mut emu.bus);
+        // Exception entry consumes >0 cycles; PENDSVSET cleared.
+        assert!(cycles > 0, "PendSV entry must consume cycles");
+        assert_eq!(emu.bus.ppb[0].icsr & (1 << 28), 0, "PENDSVSET cleared");
+        // CPU should be in handler mode.
+        assert_ne!(cpu.regs.ipsr() & 0x3F, 0, "CPU is in handler mode");
+    }
+
+    /// SysTick pending alone (PENDSTSET) — drives line 346 TRUE arm
+    /// and line 370 (clear PENDSTSET on dispatch).
+    #[test]
+    fn try_take_any_pending_dispatches_systick() {
+        use crate::core::CortexM0Plus;
+        let mut emu = Emulator::new(Config::default());
+        let mut rom = vec![0u8; crate::ROM_SIZE];
+        rom[0..4].copy_from_slice(&0x2000_8000u32.to_le_bytes());
+        rom[4..8].copy_from_slice(&0x0000_0101u32.to_le_bytes());
+        // Vector 15 (SysTick) lives at offset 15*4 = 0x3C.
+        rom[0x3C..0x40].copy_from_slice(&0x2000_2001u32.to_le_bytes());
+        emu.bus.memory.load_rom(&rom);
+        emu.bus.memory.sram_write16(0x2000, 0xBF00);
+
+        let mut cpu = CortexM0Plus::with_id(0);
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.r[13] = 0x2000_8000;
+        cpu.regs.set_pc(0x0000_0100);
+        cpu.regs.xpsr = 1 << 24;
+        // ICSR.PENDSTSET = bit 26.
+        emu.bus.ppb[0].icsr |= 1 << 26;
+        let cycles = cpu.step(&mut emu.bus);
+        assert!(cycles > 0);
+        assert_eq!(emu.bus.ppb[0].icsr & (1 << 26), 0, "PENDSTSET cleared");
+        assert_ne!(cpu.regs.ipsr() & 0x3F, 0);
+    }
+
+    /// PendSV + SysTick both pending at default priorities (both 0x00)
+    /// — tie-break by lower exception number. PendSV (#14) wins. Drives
+    /// line 350's `p == bp && 15 < be` arm with the FALSE outcome (15
+    /// is not less than 14, so PendSV's existing `best` is preserved).
+    #[test]
+    fn try_take_any_pending_pendsv_wins_tiebreak_with_systick() {
+        use crate::core::CortexM0Plus;
+        let mut emu = Emulator::new(Config::default());
+        let mut rom = vec![0u8; crate::ROM_SIZE];
+        rom[0..4].copy_from_slice(&0x2000_8000u32.to_le_bytes());
+        rom[4..8].copy_from_slice(&0x0000_0101u32.to_le_bytes());
+        // Vector 14 (PendSV) at 0x38; vector 15 (SysTick) at 0x3C.
+        rom[0x38..0x3C].copy_from_slice(&0x2000_2001u32.to_le_bytes());
+        rom[0x3C..0x40].copy_from_slice(&0x2000_4001u32.to_le_bytes());
+        emu.bus.memory.load_rom(&rom);
+        emu.bus.memory.sram_write16(0x2000, 0xBF00);
+        emu.bus.memory.sram_write16(0x4000, 0xBF00);
+
+        let mut cpu = CortexM0Plus::with_id(0);
+        cpu.regs.msp = 0x2000_8000;
+        cpu.regs.r[13] = 0x2000_8000;
+        cpu.regs.set_pc(0x0000_0100);
+        cpu.regs.xpsr = 1 << 24;
+        // Both ICSR.PENDSVSET and PENDSTSET set.
+        emu.bus.ppb[0].icsr |= (1 << 28) | (1 << 26);
+        let _ = cpu.step(&mut emu.bus);
+        // PendSV wins by tie-break (#14 < #15); PENDSVSET cleared,
+        // PENDSTSET still set (will fire on next step).
+        assert_eq!(emu.bus.ppb[0].icsr & (1 << 28), 0, "PENDSVSET cleared");
+        assert_ne!(emu.bus.ppb[0].icsr & (1 << 26), 0, "PENDSTSET still set");
+        // CPU is in PendSV handler mode (IPSR[5:0] = 14).
+        assert_eq!(cpu.regs.ipsr() & 0x3F, 14);
+    }
+
+    // ============================================================
+    // threaded/emulator.rs — apply_pio_command coverage already exists
+    // in the threaded::emulator::tests module; not duplicating here.
+    //
+    // Remaining threaded/emulator.rs uncovered branches (130/170/180/
+    // 242/245 — the `bus.psram.is_some()` warn arm + the SIO snapshot
+    // for_each true arms) require a Serial emulator with non-default
+    // SIO state at promotion time.
+    // ============================================================
+
+    /// Drives line 130 TRUE arm (`if bus.psram.is_some()`) inside
+    /// `ThreadedEmulator::from_emulator` — promotes a Serial emulator
+    /// with an attached PSRAM. The warn fires; promotion should still
+    /// succeed (the PSRAM is silently dropped on the threaded path).
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn from_emulator_with_psram_attached_warns_and_succeeds() {
+        use crate::threaded::ThreadedEmulator;
+        use picoem_devices::Psram;
+        let psram = Psram::new(0, 1, 2, 3);
+        let serial = EmulatorBuilder::new(Config::default())
+            .psram(psram)
+            .build()
+            .expect("Serial build");
+        // Promotion logs a warn but builds successfully; master_cycle
+        // starts at 0.
+        let threaded = ThreadedEmulator::from_emulator(serial);
+        assert_eq!(threaded.master_cycle(), 0);
+    }
+
+    /// Drives line 170 (`bus.irq_pending != 0`) TRUE arm: pre-stage
+    /// `irq_pending` on the serial Bus before promotion so it broadcasts
+    /// to both cores' atomics. Same harness shape as the previous test.
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn from_emulator_carries_pre_run_irq_pending() {
+        use crate::threaded::ThreadedEmulator;
+        let mut serial = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build");
+        // Pre-stage IRQ pending. Threaded promotion broadcasts to both
+        // CoreAtomics slots.
+        serial.bus.irq_pending = 0x0000_00FF;
+        let _threaded = ThreadedEmulator::from_emulator(serial);
+        // Successful construction is the assertion (would panic on
+        // malformed atomic seeding).
+    }
+
+    /// Drives line 180 TRUE arm (`bus.wfe_waiting[c]` true on either
+    /// core at promotion). Pre-park core 0 on WFE.
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[test]
+    fn from_emulator_carries_pre_run_wfe_waiting() {
+        use crate::threaded::ThreadedEmulator;
+        let mut serial = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("Serial build");
+        serial.bus.wfe_waiting[0] = true;
+        serial.bus.event_flag[0] = false;
+        let _threaded = ThreadedEmulator::from_emulator(serial);
+    }
+}

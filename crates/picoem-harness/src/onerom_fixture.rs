@@ -1563,4 +1563,86 @@ mod tests {
         let spec = synth_two_set_spec();
         assert!(lift_shadow_from_flash(&flash, 0, &spec).is_none());
     }
+
+    // -------------------------------------------------------------------
+    // stage9_residue — second-pass coverage push for parser error paths
+    // and the SDRR-helper rom_set_count==0 / data_ptr-past-EOF arms that
+    // the prior passes didn't reach.
+    // -------------------------------------------------------------------
+
+    /// `lift_shadow_from_flash` rejects a fixture whose metadata declares
+    /// `rom_set_count == 0`. Drives the line ~671 `if rom_set_index >=
+    /// rom_set_count` true arm via index 0 against count 0 (so any
+    /// `rom_set_index` is out of range), surfacing as `None`.
+    #[test]
+    fn lift_shadow_rejects_zero_rom_set_count() {
+        let mut flash = synth_flash_two_set(2);
+        flash[0xC000 + METADATA_HEADER_ROM_SET_COUNT_OFFSET] = 0;
+        let spec = synth_two_set_spec();
+        assert!(
+            lift_shadow_from_flash(&flash, 0, &spec).is_none(),
+            "rom_set_count=0 must be rejected even at index 0"
+        );
+    }
+
+    /// `parse_first_rom_type` returns `None` when `rom_set_count == 0`.
+    /// Drives the explicit zero-check at line ~767 (this function is
+    /// called transitively from `FixtureSpec::from_flash`, which surfaces
+    /// the failure as `MissingRomSet`).
+    #[test]
+    fn from_flash_rejects_zero_rom_set_count_via_first_rom_type() {
+        let mut flash = synth_fixture_flash();
+        // Zero out rom_set_count in the metadata header (synth helper sets
+        // it to 1 at offset 0xC000 + 20).
+        flash[0xC000 + METADATA_HEADER_ROM_SET_COUNT_OFFSET] = 0;
+        match FixtureSpec::from_flash(&flash) {
+            Err(FixtureError::MissingRomSet) => {}
+            other => panic!("expected MissingRomSet for zero rom_set_count, got {other:?}"),
+        }
+    }
+
+    /// `lift_shadow_from_flash` returns `None` when the metadata pointer
+    /// resolves to an offset past EOF — drives the line ~658 `if off >=
+    /// flash.len()` true arm via the `ptr_to_off` closure inside
+    /// `lift_shadow_from_flash` (distinct from the metadata_ptr below
+    /// FLASH_BASE case already covered).
+    #[test]
+    fn lift_shadow_rejects_metadata_ptr_past_eof() {
+        let mut flash = synth_flash_two_set(2);
+        // Point metadata_ptr beyond flash end (still above FLASH_BASE so
+        // the checked_sub succeeds, but the resulting off >= flash.len()).
+        let huge_ptr = FLASH_BASE + flash.len() as u32 + 0x100;
+        flash[SDRR_INFO_OFFSET + SDRR_INFO_METADATA_PTR_OFFSET
+            ..SDRR_INFO_OFFSET + SDRR_INFO_METADATA_PTR_OFFSET + 4]
+            .copy_from_slice(&huge_ptr.to_le_bytes());
+        let spec = synth_two_set_spec();
+        assert!(lift_shadow_from_flash(&flash, 0, &spec).is_none());
+    }
+
+    /// `parse_rom_set_layout` returns `None` when the per-set data
+    /// pointer falls outside the flash image. Drives the line ~705
+    /// `if off >= flash.len()` true arm inside the helper's `ptr_to_off`
+    /// closure for the second walk (set descriptor data ptr).
+    #[test]
+    fn parse_rom_set_layout_rejects_data_ptr_past_eof() {
+        let mut flash = synth_flash_two_set(2);
+        // Patch set 0's data_ptr to an offset just past flash end.
+        let bad_ptr = FLASH_BASE + flash.len() as u32;
+        flash[0xC100 + ROM_SET_DATA_PTR_OFFSET..0xC100 + ROM_SET_DATA_PTR_OFFSET + 4]
+            .copy_from_slice(&bad_ptr.to_le_bytes());
+        assert!(parse_rom_set_layout(&flash).is_none());
+    }
+
+    /// `parse_rom_set_layout` returns `None` when the rom_sets array
+    /// pointer itself resolves below `FLASH_BASE`. Drives the line ~704
+    /// `checked_sub(FLASH_BASE)` None arm for the rom_sets pointer.
+    #[test]
+    fn parse_rom_set_layout_rejects_rom_sets_ptr_below_flash_base() {
+        let mut flash = synth_flash_two_set(2);
+        let bad = 0x0000_2000u32; // below FLASH_BASE
+        flash[0xC000 + METADATA_HEADER_ROM_SETS_PTR_OFFSET
+            ..0xC000 + METADATA_HEADER_ROM_SETS_PTR_OFFSET + 4]
+            .copy_from_slice(&bad.to_le_bytes());
+        assert!(parse_rom_set_layout(&flash).is_none());
+    }
 }
