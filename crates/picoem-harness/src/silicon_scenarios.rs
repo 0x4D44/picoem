@@ -1816,6 +1816,58 @@ pub const SCENARIOS: &[PeriphScenario] = &[
         // 4 transfers at 1/10 rate → at least 40 sysclks.
         min_sysclks: 40,
     },
+    // DMA Pacing-Within-Step-Quantum HLD V0.1.0 §4.3.1 — DMA paced on
+    // DREQ_PIO0_RX0.  PIO0 SM0 autopushes 8 constant words (0x0000_0004)
+    // into RX FIFO; CH0 drains them to SRAM at 0x2000_0B00.  Wiring
+    // regression coverage at quantum=1; the quantum-invariance integration
+    // test (`crates/rp2350-emu/tests/dma_quantum_invariance.rs`) gates
+    // the §3 fix at higher quanta.
+    //
+    // Calibration 2026-05-06: EMU baseline = 67 sysclks.  Pre-silicon-run
+    // band is half-baseline floor (33) to a conservative ceiling (2000).
+    // Re-tighten both bounds against actual silicon measurements once a
+    // probe attaches.
+    //
+    // FDEBUG.TXSTALL/RXSTALL are NOT observed because rp2350-emu's PIO
+    // model does not currently implement those bits — there is no
+    // writer to `PioBlock::fdebug` for TXSTALL/RXSTALL anywhere in the
+    // workspace (searched 2026-05-06: `picoem-common/src/pio/mod.rs`
+    // only zero-inits and W1C/SET/CLR/XOR-aliases the field; nothing
+    // sets it from SM execution).  Silicon would set TXSTALL during the
+    // post-DMA drain spin → false-positive divergence.  Tracked as a
+    // separate concern: implement FDEBUG.{TXSTALL, RXSTALL, TXOVER,
+    // RXUNDER} writers in `picoem-common/src/pio/sm.rs` exec_pull /
+    // exec_push paths.
+    PeriphScenario {
+        name: "dma_pio_rx_paced",
+        setup: S_DMA_PIO_RX_PACED,
+        // Initial pre-calibration values; tightened post-silicon-run.
+        max_sysclks: 2_000,
+        observe: O_DMA_PIO_RX_PACED,
+        observe_pins: 0,
+        custom_sled: Some(SLED_DMA_PIO_RX_PACED),
+        // Half EMU baseline floor (67 / 2 = 33).  See header above.
+        min_sysclks: 33,
+    },
+    // HLD V0.1.0 §4.3.2 — DMA paced on DREQ_PIO0_TX0.  CH0 sources 8 words
+    // from SRAM into PIO0 SM0 TX FIFO; SM0 runs OUT NULL,32 with AUTOPULL
+    // to drain the FIFO so DREQ stays asserted.  Observables: DMA INTR
+    // bit 0, BUSY clear, PIO0 SM0 TX FIFO empty.
+    //
+    // Calibration 2026-05-06: EMU baseline = 90 sysclks.  Same
+    // half-baseline-floor / 2000-ceiling pre-calibration band as
+    // dma_pio_rx_paced; same FDEBUG model-gap caveat applies (see RX
+    // scenario header above).
+    PeriphScenario {
+        name: "dma_pio_tx_paced",
+        setup: S_DMA_PIO_TX_PACED,
+        max_sysclks: 2_000,
+        observe: O_DMA_PIO_TX_PACED,
+        observe_pins: 0,
+        custom_sled: Some(SLED_DMA_PIO_TX_PACED),
+        // Half EMU baseline floor (90 / 2 = 45).  See header above.
+        min_sysclks: 45,
+    },
     // Phase 1 Expansion — SIO unsigned divider.
     PeriphScenario {
         name: "sio_divider_unsigned",
@@ -2667,6 +2719,359 @@ const SLED_DMA_TIMER_PACED_HW: [u16; 49] = [
 ];
 const SLED_DMA_TIMER_PACED: &[u8] = &halfwords_to_le_bytes::<49, 98>(SLED_DMA_TIMER_PACED_HW);
 
+// ---------------------------------------------------------------------------
+// dma_pio_rx_paced  (HLD V0.1.0 §4.3.1)
+//
+// DMA CH0 paced on DREQ_PIO0_RX0 (TREQ_SEL=4) drains 8 words from PIO0
+// SM0's RX FIFO into SRAM.  PIO0 SM0 runs a 3-instruction program with
+// AUTOPUSH enabled:
+//
+//   slot 0:  SET X, 4        (0xE024)  — load constant 4 into X
+//   slot 1:  IN  X, 32       (0x4020)  — shift X into ISR; AUTOPUSH fires
+//                                        on threshold (PUSH_THRESH=0=32)
+//                                        and lands 0x0000_0004 in RX FIFO
+//   slot 2:  NOP / MOV Y, Y  (0xA042)  — filler so wrap-top sits at a
+//                                        real instruction
+//
+// EXECCTRL.WRAP_TOP = 2, WRAP_BOTTOM = 0 → SM loops slots 0..=2 forever.
+// CLKDIV defaults (int=1, frac=0).  After enable, SM produces one
+// 0x0000_0004 word every 3 sysclks (3-instruction loop).
+//
+// Each silicon scenario name is matched by `gate_peripheral_*` on the
+// "pio0"/"pio1"/"pll_sys" prefix to disable the peripheral after BKPT —
+// `dma_pio_*` does not match, so PIO0 keeps running on HW between BKPT
+// and the runner's observable read.  That's fine: we only observe DMA
+// state (destination words, INTR, BUSY).  PIO continuing to run on HW
+// (filling RX FIFO and stalling on AUTOPUSH-FIFO-full) does not affect
+// the diff.  On EMU, peripherals freeze at BKPT — same outcome by
+// virtue of having stopped at a state that's already past DMA
+// completion.
+//
+// CTRL_TRIG breakdown (RP2350 V6 §12.6.6):
+//   bit 0       EN = 1
+//   bits[3:2]   DATA_SIZE = 2 (word)
+//   bit 4       INCR_READ = 0  (PIO0 RXF0 is FIFO MMIO — must not increment)
+//   bit 5       INCR_READ_REV = 0
+//   bit 6       INCR_WRITE = 1
+//   bit 7       INCR_WRITE_REV = 0
+//   bits[11:8]  RING_SIZE = 0
+//   bit 12      RING_SEL = 0
+//   bits[16:13] CHAIN_TO = 0 (self = no chain)
+//   bits[22:17] TREQ_SEL = 4 (DREQ_PIO0_RX0)  → 4<<17 = 0x0008_0000
+//   → 0x0008_0049
+//
+// SHIFTCTRL value = 0x000D_0000 = default (0x000C_0000: IN_SHIFTDIR=1,
+// OUT_SHIFTDIR=1, thresholds=0=32) | AUTOPUSH (bit 16).  PUSH_THRESH=0
+// (=32) means autopush fires when ISR has 32 bits — exactly what
+// `IN X, 32` produces in one shot.
+//
+// EXECCTRL value = 0x0000_2000 = WRAP_TOP=2 (bits[16:12]) | rest=0.
+const S_DMA_PIO_RX_PACED: &[(u32, u32)] = &[
+    // Hard-reset PIO0 (defensive, matches existing pio0_* pattern):
+    // wipes instr_mem[], SM state, FIFOs, irq_flags so a prior
+    // scenario's program cannot persist through the Fisher-Yates
+    // shuffle.
+    (RESETS_RESET + ALIAS_SET, RESET_PIO0),
+    (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
+    // Release DMA from reset (matches dma_chain_trigger / dma_timer_paced).
+    (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
+];
+const O_DMA_PIO_RX_PACED: &[(u32, u32)] = &[
+    // Eight 0x0000_0004 words at 0x2000_0B00..0x2000_0B1C.
+    (0x2000_0B00, 0xFFFF_FFFF),
+    (0x2000_0B04, 0xFFFF_FFFF),
+    (0x2000_0B08, 0xFFFF_FFFF),
+    (0x2000_0B0C, 0xFFFF_FFFF),
+    (0x2000_0B10, 0xFFFF_FFFF),
+    (0x2000_0B14, 0xFFFF_FFFF),
+    (0x2000_0B18, 0xFFFF_FFFF),
+    (0x2000_0B1C, 0xFFFF_FFFF),
+    // DMA INTR bit 0 must be set (transfer complete).
+    (DMA_INTR, 0x0000_0001),
+];
+
+// Sled for dma_pio_rx_paced (57 halfwords = 114 bytes).
+//
+// Register assignments:
+//   r0 — CTRL_TRIG readback scratch
+//   r1 — DMA_BASE (0x5000_0000)
+//   r2 — PIO0_BASE (0x5020_0000)
+//   r3 — BUSY mask (0x0400_0000 = bit 26)
+//   r4 — config / address scratch
+//   r5 — PIO0 SM0 base (0x5020_00C8) — reaches CLKDIV/EXECCTRL/SHIFTCTRL
+//        via [r5, #imm5*4] within the 31-stride imm5 window.
+//
+// Phase layout:
+//   [ 0.. 3]  build r2 = PIO0_BASE
+//   [ 4.. 6]  write INSTR_MEM[0] = 0xE024 (SET X, 4)
+//   [ 7.. 9]  write INSTR_MEM[1] = 0x4020 (IN X, 32)
+//   [10..12]  write INSTR_MEM[2] = 0xA042 (NOP / MOV Y, Y)
+//   [13..16]  build r5 = PIO0 SM0 base (0x5020_00C8)
+//   [17..20]  write SM0 CLKDIV = 0x0001_0000
+//   [21..23]  write SM0 EXECCTRL = 0x0000_2000 (WRAP_TOP=2)
+//   [24..27]  write SM0 SHIFTCTRL = 0x000D_0000 (default + AUTOPUSH)
+//   [28..29]  enable PIO0 SM0 (CTRL = 1)
+//   [30..33]  build r1 = DMA_BASE
+//   [34..38]  CH0 READ_ADDR = 0x5020_0020 (PIO0 RXF0)
+//   [39..43]  CH0 WRITE_ADDR = 0x2000_0B00
+//   [44..45]  CH0 TRANS_COUNT = 8
+//   [46..50]  CH0 CTRL_TRIG = 0x0008_0049 (triggers DMA; arm + run)
+//   [51..52]  build BUSY mask in r3 (bit 26)
+//   [53..55]  busy-poll CH0 CTRL_TRIG.BUSY
+//   [56]      bkpt #0
+//
+// PIO continues running between BKPT and observable read on HW (no
+// gate match for `dma_pio_*` prefix); the destination buffer + INTR +
+// BUSY observables are unaffected because they're DMA-side state.
+#[rustfmt::skip]
+const SLED_DMA_PIO_RX_PACED_HW: [u16; 57] = [
+    // ---- build r2 = PIO0_BASE (0x5020_0000) -------------------------------
+    0xF240, //  [ 0] movw r2, #0x0000 hw0
+    0x0200, //  [ 1] movw r2, #0x0000 hw1   (Rd=2)
+    0xF2C5, //  [ 2] movt r2, #0x5020 hw0   (imm4=5,i=0)
+    0x0220, //  [ 3] movt r2, #0x5020 hw1   (Rd=2,imm8=0x20)
+    // ---- INSTR_MEM[0] = 0xE024 (SET X, 4) at PIO0_BASE+0x048 (imm5=18) ----
+    // movw r4, #0xE024: imm4=0xE,i=0,imm3=0,imm8=0x24
+    0xF24E, //  [ 4] movw r4, #0xE024 hw0
+    0x0424, //  [ 5] movw r4, #0xE024 hw1   (Rd=4,imm8=0x24)
+    0x6494, //  [ 6] str  r4, [r2, #0x48]   (imm5=18 → 0x6000|0x480|0x10|4)
+    // ---- INSTR_MEM[1] = 0x4020 (IN X, 32) at PIO0_BASE+0x04C (imm5=19) ----
+    // movw r4, #0x4020: imm4=4,i=0,imm3=0,imm8=0x20
+    0xF244, //  [ 7] movw r4, #0x4020 hw0
+    0x0420, //  [ 8] movw r4, #0x4020 hw1
+    0x64D4, //  [ 9] str  r4, [r2, #0x4C]   (imm5=19 → 0x6000|0x4C0|0x10|4)
+    // ---- INSTR_MEM[2] = 0xA042 (NOP via MOV Y, Y) at +0x050 (imm5=20) -----
+    // movw r4, #0xA042: imm4=0xA,i=0,imm3=0,imm8=0x42
+    0xF24A, //  [10] movw r4, #0xA042 hw0
+    0x0442, //  [11] movw r4, #0xA042 hw1
+    0x6514, //  [12] str  r4, [r2, #0x50]   (imm5=20 → 0x6000|0x500|0x10|4)
+    // ---- build r5 = PIO0 SM0 base (0x5020_00C8) ---------------------------
+    // movw r5, #0x00C8: imm4=0,i=0,imm3=0,imm8=0xC8
+    0xF240, //  [13] movw r5, #0x00C8 hw0
+    0x05C8, //  [14] movw r5, #0x00C8 hw1   (Rd=5,imm8=0xC8)
+    0xF2C5, //  [15] movt r5, #0x5020 hw0
+    0x0520, //  [16] movt r5, #0x5020 hw1   (Rd=5,imm8=0x20)
+    // ---- SM0 CLKDIV = 0x0001_0000 (int=1, frac=0) at [r5, #0] ------------
+    0x2400, //  [17] movs r4, #0
+    0xF2C0, //  [18] movt r4, #0x0001 hw0   (imm4=0,i=0,imm3=0,imm8=1)
+    0x0401, //  [19] movt r4, #0x0001 hw1   (Rd=4,imm8=1)
+    0x602C, //  [20] str  r4, [r5, #0]      (CLKDIV)
+    // ---- SM0 EXECCTRL = 0x0000_2000 (WRAP_TOP=2[16:12]) at [r5, #4] ------
+    // movw r4, #0x2000: imm4=2,i=0,imm3=0,imm8=0
+    0xF242, //  [21] movw r4, #0x2000 hw0
+    0x0400, //  [22] movw r4, #0x2000 hw1   (Rd=4)
+    0x606C, //  [23] str  r4, [r5, #4]      (EXECCTRL, imm5=1)
+    // ---- SM0 SHIFTCTRL = 0x000D_0000 (default+AUTOPUSH) at [r5, #8] ------
+    // 0x000D_0000 = 0x000C_0000 (default IN/OUT_SHIFTDIR=1) | (1<<16) AUTOPUSH
+    0x2400, //  [24] movs r4, #0
+    0xF2C0, //  [25] movt r4, #0x000D hw0
+    0x040D, //  [26] movt r4, #0x000D hw1   (Rd=4,imm8=0xD)
+    0x60AC, //  [27] str  r4, [r5, #8]      (SHIFTCTRL, imm5=2)
+    // ---- enable PIO0 SM0 (CTRL = 1, only SM0; SM1-3 stay disabled) -------
+    0x2401, //  [28] movs r4, #1
+    0x6014, //  [29] str  r4, [r2, #0]      (CTRL)
+    // ---- build r1 = DMA_BASE (0x5000_0000) -------------------------------
+    0xF240, //  [30] movw r1, #0x0000 hw0
+    0x0100, //  [31] movw r1, #0x0000 hw1   (Rd=1)
+    0xF2C5, //  [32] movt r1, #0x5000 hw0
+    0x0100, //  [33] movt r1, #0x5000 hw1   (Rd=1)
+    // ---- CH0 READ_ADDR = 0x5020_0020 (PIO0 RXF0) -------------------------
+    0xF240, //  [34] movw r4, #0x0020 hw0
+    0x0420, //  [35] movw r4, #0x0020 hw1   (Rd=4,imm8=0x20)
+    0xF2C5, //  [36] movt r4, #0x5020 hw0
+    0x0420, //  [37] movt r4, #0x5020 hw1   (Rd=4,imm8=0x20)
+    0x600C, //  [38] str  r4, [r1, #0]      (CH0 READ_ADDR)
+    // ---- CH0 WRITE_ADDR = 0x2000_0B00 -----------------------------------
+    // movw r4, #0x0B00: imm4=0,i=1 (bit 11 of 0x0B00=1),imm3=3,imm8=0
+    0xF640, //  [39] movw r4, #0x0B00 hw0   (i=1 → 0xF240|(1<<10)=0xF640)
+    0x3400, //  [40] movw r4, #0x0B00 hw1   (imm3=3,Rd=4,imm8=0)
+    0xF2C2, //  [41] movt r4, #0x2000 hw0
+    0x0400, //  [42] movt r4, #0x2000 hw1
+    0x604C, //  [43] str  r4, [r1, #4]      (CH0 WRITE_ADDR, imm5=1)
+    // ---- CH0 TRANS_COUNT = 8 ---------------------------------------------
+    0x2408, //  [44] movs r4, #8
+    0x608C, //  [45] str  r4, [r1, #8]      (CH0 TRANS_COUNT, imm5=2)
+    // ---- CH0 CTRL_TRIG = 0x0008_0049 (EN|DATA_SIZE=2|INCR_WRITE|TREQ=4) --
+    // low16 = 0x0049: imm4=0,i=0,imm3=0,imm8=0x49
+    // high16 = 0x0008: imm4=0,i=0,imm3=0,imm8=8
+    0xF240, //  [46] movw r4, #0x0049 hw0
+    0x0449, //  [47] movw r4, #0x0049 hw1   (Rd=4)
+    0xF2C0, //  [48] movt r4, #0x0008 hw0
+    0x0408, //  [49] movt r4, #0x0008 hw1   (Rd=4,imm8=8)
+    0x60CC, //  [50] str  r4, [r1, #0x0C]   (CH0 CTRL_TRIG → triggers)
+    // ---- BUSY mask in r3 (bit 26 = 0x0400_0000) --------------------------
+    0x2301, //  [51] movs r3, #1
+    0x069B, //  [52] lsls r3, r3, #26
+    // ---- busy-poll CH0 CTRL_TRIG.BUSY -----------------------------------
+    // B<cond> T1: target = PC + 4 + SignExtend(imm8,8)*2.
+    // [55] at byte 110. PC = byte110+4 = byte 114. Target = byte 106 ([53]).
+    // imm8 = (106 - 114) / 2 = -4 = 0xFC.
+    0x68C8, //  [53] ldr  r0, [r1, #0x0C]   (read CH0 CTRL_TRIG; Rt=0)
+    0x4218, //  [54] tst  r0, r3            (test BUSY bit 26)
+    0xD1FC, //  [55] bne  [53]              (loop while BUSY set)
+    0xBE00, //  [56] bkpt #0
+];
+const SLED_DMA_PIO_RX_PACED: &[u8] = &halfwords_to_le_bytes::<57, 114>(SLED_DMA_PIO_RX_PACED_HW);
+
+// ---------------------------------------------------------------------------
+// dma_pio_tx_paced  (HLD V0.1.0 §4.3.2)
+//
+// Mirror direction.  DMA CH0 sources 8 words from SRAM (whatever's
+// there — content unobserved) and pushes them to PIO0 SM0 TX FIFO,
+// paced on DREQ_PIO0_TX0 (TREQ_SEL=0).  PIO0 SM0 runs a 1-instruction
+// program with AUTOPULL enabled:
+//
+//   slot 0:  OUT NULL, 32  (0x6060)  — discards 32 bits from OSR; the
+//                                      AUTOPULL on every iteration
+//                                      refills OSR from TX FIFO,
+//                                      keeping the FIFO drained so
+//                                      DREQ_PIO0_TX0 stays asserted.
+//
+// EXECCTRL.WRAP_TOP=0, WRAP_BOTTOM=0 → 1-instruction loop.  CLKDIV
+// defaults.  Choice of OUT NULL (vs OUT PINS as the HLD §4.3.2 example
+// suggested) is intentional: the GPIO-pin observable in §4.3.2 is
+// flagged "optional, skip if it adds significant sled complexity".
+// Skipping pin output saves PINCTRL setup, IO_BANK0 / PADS_BANK0
+// routing, and a GPIO observe-pins entry — the DMA-side wiring
+// (DREQ_PIO0_TX0, DMA-side MMIO write to PIO0 TXF0) is fully exercised
+// either way.
+//
+// Drain-spin tail: after BUSY clears, the sled spins for ~48 sysclks
+// to give PIO time to consume the last 0..1 TX-FIFO entries before
+// BKPT.  On HW, PIO continues running between BKPT and observe (no
+// `gate_peripheral_*` match for `dma_pio_*`); on EMU, peripherals
+// freeze at BKPT.  The drain spin equalises both paths so the
+// FLEVEL-TX=0 observable is robust regardless of the fix.
+//
+// CTRL_TRIG breakdown:
+//   bit 0       EN = 1
+//   bits[3:2]   DATA_SIZE = 2 (word)
+//   bit 4       INCR_READ = 1
+//   bit 5       INCR_READ_REV = 0
+//   bit 6       INCR_WRITE = 0  (PIO0 TXF0 is FIFO MMIO — must not increment)
+//   bits[16:13] CHAIN_TO = 0
+//   bits[22:17] TREQ_SEL = 0 (DREQ_PIO0_TX0)
+//   → 0x0000_0019
+//
+// SHIFTCTRL value = 0x000E_0000 = default (0x000C_0000) | AUTOPULL
+// (bit 17).
+const S_DMA_PIO_TX_PACED: &[(u32, u32)] = &[
+    (RESETS_RESET + ALIAS_SET, RESET_PIO0),
+    (RESETS_RESET + ALIAS_CLR, RESET_PIO0),
+    (RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT),
+];
+/// PIO0 FLEVEL register — TX[3:0] for SM0 in bits[3:0], RX[3:0] in bits[7:4]
+/// (per `picoem-common/src/pio/mod.rs::flevel`).
+const PIO0_FLEVEL: u32 = PIO0_BASE + 0x00C;
+const O_DMA_PIO_TX_PACED: &[(u32, u32)] = &[
+    // PIO0 SM0 TX FIFO must be empty (FLEVEL bits[3:0] = 0).  Bits[7:4]
+    // (RX) are unused on the TX-paced path; mask just the TX nibble.
+    (PIO0_FLEVEL, 0x0000_000F),
+    // DMA INTR bit 0 must be set (transfer complete).
+    (DMA_INTR, 0x0000_0001),
+];
+
+// Sled for dma_pio_tx_paced (50 halfwords = 100 bytes).
+//
+// Register assignments — same as RX sled.
+//
+// Phase layout:
+//   [ 0.. 3]  build r2 = PIO0_BASE
+//   [ 4.. 6]  write INSTR_MEM[0] = 0x6060 (OUT NULL, 32)
+//   [ 7..10]  build r5 = PIO0 SM0 base
+//   [11..14]  write SM0 CLKDIV = 0x0001_0000
+//   [15..16]  write SM0 EXECCTRL = 0 (WRAP_TOP=0 → 1-insn loop)
+//   [17..20]  write SM0 SHIFTCTRL = 0x000E_0000 (default+AUTOPULL)
+//   [21..22]  enable PIO0 SM0 (CTRL = 1)
+//   [23..26]  build r1 = DMA_BASE
+//   [27..31]  CH0 READ_ADDR = 0x2000_0C00 (SRAM source; content unread)
+//   [32..36]  CH0 WRITE_ADDR = 0x5020_0010 (PIO0 TXF0)
+//   [37..38]  CH0 TRANS_COUNT = 8
+//   [39..40]  CH0 CTRL_TRIG = 0x0000_0019 (triggers)
+//   [41..42]  build BUSY mask in r3
+//   [43..45]  busy-poll
+//   [46..48]  drain spin (16 iterations × 3 cycles ≈ 48 sysclks PIO drain)
+//   [49]      bkpt #0
+#[rustfmt::skip]
+const SLED_DMA_PIO_TX_PACED_HW: [u16; 50] = [
+    // ---- build r2 = PIO0_BASE -------------------------------------------
+    0xF240, //  [ 0] movw r2, #0x0000 hw0
+    0x0200, //  [ 1] movw r2, #0x0000 hw1   (Rd=2)
+    0xF2C5, //  [ 2] movt r2, #0x5020 hw0
+    0x0220, //  [ 3] movt r2, #0x5020 hw1   (Rd=2,imm8=0x20)
+    // ---- INSTR_MEM[0] = 0x6060 (OUT NULL, 32) ---------------------------
+    // movw r4, #0x6060: imm4=6,i=0,imm3=0,imm8=0x60
+    0xF246, //  [ 4] movw r4, #0x6060 hw0
+    0x0460, //  [ 5] movw r4, #0x6060 hw1   (Rd=4,imm8=0x60)
+    0x6494, //  [ 6] str  r4, [r2, #0x48]   (imm5=18)
+    // ---- build r5 = PIO0 SM0 base ---------------------------------------
+    0xF240, //  [ 7] movw r5, #0x00C8 hw0
+    0x05C8, //  [ 8] movw r5, #0x00C8 hw1
+    0xF2C5, //  [ 9] movt r5, #0x5020 hw0
+    0x0520, //  [10] movt r5, #0x5020 hw1
+    // ---- SM0 CLKDIV = 0x0001_0000 ---------------------------------------
+    0x2400, //  [11] movs r4, #0
+    0xF2C0, //  [12] movt r4, #0x0001 hw0
+    0x0401, //  [13] movt r4, #0x0001 hw1
+    0x602C, //  [14] str  r4, [r5, #0]      (CLKDIV)
+    // ---- SM0 EXECCTRL = 0 (WRAP_TOP=0 → 1-instr loop) -------------------
+    0x2400, //  [15] movs r4, #0
+    0x606C, //  [16] str  r4, [r5, #4]      (EXECCTRL, imm5=1)
+    // ---- SM0 SHIFTCTRL = 0x000E_0000 (default + AUTOPULL bit 17) --------
+    0x2400, //  [17] movs r4, #0
+    0xF2C0, //  [18] movt r4, #0x000E hw0
+    0x040E, //  [19] movt r4, #0x000E hw1   (Rd=4,imm8=0xE)
+    0x60AC, //  [20] str  r4, [r5, #8]      (SHIFTCTRL, imm5=2)
+    // ---- enable PIO0 SM0 (CTRL = 1) -------------------------------------
+    0x2401, //  [21] movs r4, #1
+    0x6014, //  [22] str  r4, [r2, #0]
+    // ---- build r1 = DMA_BASE --------------------------------------------
+    0xF240, //  [23] movw r1, #0x0000 hw0
+    0x0100, //  [24] movw r1, #0x0000 hw1
+    0xF2C5, //  [25] movt r1, #0x5000 hw0
+    0x0100, //  [26] movt r1, #0x5000 hw1
+    // ---- CH0 READ_ADDR = 0x2000_0C00 (SRAM source, content unobserved) --
+    // movw r4, #0x0C00: imm4=0,i=1,imm3=4,imm8=0
+    0xF640, //  [27] movw r4, #0x0C00 hw0   (i=1)
+    0x4400, //  [28] movw r4, #0x0C00 hw1   (imm3=4,Rd=4,imm8=0)
+    0xF2C2, //  [29] movt r4, #0x2000 hw0
+    0x0400, //  [30] movt r4, #0x2000 hw1
+    0x600C, //  [31] str  r4, [r1, #0]      (CH0 READ_ADDR)
+    // ---- CH0 WRITE_ADDR = 0x5020_0010 (PIO0 TXF0) -----------------------
+    0xF240, //  [32] movw r4, #0x0010 hw0
+    0x0410, //  [33] movw r4, #0x0010 hw1   (Rd=4,imm8=0x10)
+    0xF2C5, //  [34] movt r4, #0x5020 hw0
+    0x0420, //  [35] movt r4, #0x5020 hw1   (Rd=4,imm8=0x20)
+    0x604C, //  [36] str  r4, [r1, #4]      (CH0 WRITE_ADDR)
+    // ---- CH0 TRANS_COUNT = 8 --------------------------------------------
+    0x2408, //  [37] movs r4, #8
+    0x608C, //  [38] str  r4, [r1, #8]
+    // ---- CH0 CTRL_TRIG = 0x0000_0019 (EN|DATA_SIZE=2|INCR_READ|TREQ=0) --
+    0x2419, //  [39] movs r4, #0x19         (CTRL fits in imm8: 0x19=25)
+    0x60CC, //  [40] str  r4, [r1, #0x0C]   (CH0 CTRL_TRIG → triggers)
+    // ---- BUSY mask in r3 ------------------------------------------------
+    0x2301, //  [41] movs r3, #1
+    0x069B, //  [42] lsls r3, r3, #26
+    // ---- busy-poll CH0 BUSY ---------------------------------------------
+    // [45] at byte 90. PC = byte94. Target = byte 86 ([43]). imm8=-4=0xFC.
+    0x68C8, //  [43] ldr  r0, [r1, #0x0C]
+    0x4218, //  [44] tst  r0, r3
+    0xD1FC, //  [45] bne  [43]
+    // ---- drain spin (16 × 3 ≈ 48 sysclks PIO drain) ---------------------
+    // PIO is still enabled and consuming TX FIFO via OUT NULL with AUTOPULL.
+    // After BUSY clears, the TX FIFO has at most 1 word (steady-state DMA
+    // push / PIO pull oscillation).  16 iterations of subs+bne is 48
+    // sysclks — overkill for a 1-word drain at 1 word/sysclk.
+    //
+    // BNE T1: subs at byte 92, bne at byte 94. PC = byte 94+4 = 98.
+    // Target = byte 92.  imm8 = (92-98)/2 = -3 = 0xFD.
+    0x2410, //  [46] movs r4, #16
+    0x3C01, //  [47] subs r4, #1
+    0xD1FD, //  [48] bne  [47]              (imm8=-3 → loop until r4=0)
+    0xBE00, //  [49] bkpt #0
+];
+const SLED_DMA_PIO_TX_PACED: &[u8] = &halfwords_to_le_bytes::<50, 100>(SLED_DMA_PIO_TX_PACED_HW);
+
 /// Red-path catalogue. Selected by `silicon_periph_diff_rp2350
 /// --red-path` (mutually exclusive with the default catalogue).
 pub const RED_PATH_SCENARIOS: &[PeriphScenario] = &[
@@ -3480,6 +3885,14 @@ mod tests {
             validate_custom_sled(SLED_DMA_TIMER_PACED).is_ok(),
             "dma_timer_paced sled must validate",
         );
+        assert!(
+            validate_custom_sled(SLED_DMA_PIO_RX_PACED).is_ok(),
+            "dma_pio_rx_paced sled must validate",
+        );
+        assert!(
+            validate_custom_sled(SLED_DMA_PIO_TX_PACED).is_ok(),
+            "dma_pio_tx_paced sled must validate",
+        );
     }
 
     // ---- Catalogue presence tests for Stage 4 scenarios -----------------
@@ -3587,6 +4000,8 @@ mod tests {
             "dma_mem_to_mem_32bit",
             "dma_chain_trigger",
             "dma_timer_paced",
+            "dma_pio_rx_paced",
+            "dma_pio_tx_paced",
         ]
         .into_iter()
         .collect();
@@ -3942,6 +4357,127 @@ mod tests {
             emu.mmio_read32(0x5000_0420),
             0,
             "RP2040 legacy TIMER0 offset must remain unmapped (read-as-zero on RP2350)"
+        );
+    }
+
+    /// Helper for the dma_pio_* sleds: applies the same RESETS preamble the
+    /// silicon runner does (PIO0 hard-reset pulse + DMA out of reset) before
+    /// loading and stepping the sled.  Mirrors `run_dma_sled_on_emu` but
+    /// with the extra PIO0 release.
+    fn run_dma_pio_sled_on_emu(sled: &'static [u8], budget: u64) -> rp2350_emu::Emulator {
+        use rp2350_emu::{Config, EmulatorBuilder};
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .unwrap();
+        // Mirror the setup table: hard-reset pulse PIO0 + release DMA.
+        emu.mmio_write32(RESETS_RESET + ALIAS_SET, RESET_PIO0);
+        emu.mmio_write32(RESETS_RESET + ALIAS_CLR, RESET_PIO0);
+        emu.mmio_write32(RESETS_RESET + ALIAS_CLR, RESET_DMA_BIT);
+        // Load and run the sled.
+        emu.load_image(SILICON_RUN_SLED, sled);
+        {
+            let c = emu.core_mut(0);
+            c.wake();
+            c.set_reg(13, EMU_TEST_STACK);
+            c.set_reg(14, 0xFFFF_FFFF);
+            c.regs.set_pc(SILICON_RUN_SLED);
+            c.regs.xpsr = 0x0100_0000;
+        }
+        let bkpt_pc = SILICON_RUN_SLED + (sled.len() as u32) - 2;
+        let start = emu.cycles();
+        while emu.core(0).regs.pc() != bkpt_pc && emu.cycles().saturating_sub(start) < budget {
+            emu.step().expect("Serial step is infallible");
+        }
+        assert_eq!(
+            emu.core(0).regs.pc(),
+            bkpt_pc,
+            "sled did not reach BKPT within {budget} cycles (PC=0x{:08X})",
+            emu.core(0).regs.pc(),
+        );
+        emu
+    }
+
+    /// EMU-side correctness check for `dma_pio_rx_paced` — verifies
+    /// that the sled's PIO+DMA setup produces the expected DMA-side
+    /// observables.  This is the EMU half of the silicon diff: if HW
+    /// observes anything different, the silicon scenario fails (which
+    /// is exactly the point).
+    #[test]
+    fn test_dma_pio_rx_paced_sled_on_emu() {
+        // Sled-execution budget: tight ceiling above the measured EMU
+        // baseline (67 sysclks 2026-05-06) so a runaway pacing bug
+        // (e.g. DMA never advancing, BUSY-poll spinning forever) trips
+        // the budget assertion fast instead of hiding under a generous
+        // 4000-cycle margin.  500 = ~7× headroom.
+        let mut emu = run_dma_pio_sled_on_emu(SLED_DMA_PIO_RX_PACED, 500);
+        // 8 destination words at 0x2000_0B00..0x2000_0B1C must each be
+        // 0x0000_0004 (the constant the SET X,4 / IN X,32 program autopushes).
+        for i in 0..8u32 {
+            assert_eq!(
+                emu.mmio_read32(0x2000_0B00 + i * 4),
+                0x0000_0004,
+                "word {i}",
+            );
+        }
+        // DMA INTR bit 0 must be set (CH0 transfer complete).
+        assert_ne!(
+            emu.mmio_read32(DMA_INTR) & 0x0000_0001,
+            0,
+            "DMA INTR bit 0",
+        );
+        // CH0 BUSY must be clear (busy-poll only exits when BUSY=0).
+        assert_eq!(
+            emu.mmio_read32(DMA_BASE + 0x0C) & 0x0400_0000,
+            0,
+            "CH0 BUSY must be clear",
+        );
+        // Pacing-drift regression band.  EMU baseline 2026-05-06 = 67
+        // sysclks; a ±~10-cycle band (60..=80) catches drift in the
+        // §3 within-quantum DMA pacing fix without silicon access.  If
+        // a future EMU change shifts the baseline meaningfully, update
+        // both this band and the silicon scenario's `min_sysclks`.
+        let cycles = emu.cycles();
+        assert!(
+            (60..=80).contains(&cycles),
+            "dma_pio_rx_paced EMU sysclks {cycles} drifted out of expected band 60..=80",
+        );
+    }
+
+    /// EMU-side correctness check for `dma_pio_tx_paced`.  After the
+    /// drain spin in the sled, PIO0 SM0 TX FIFO must be empty.
+    #[test]
+    fn test_dma_pio_tx_paced_sled_on_emu() {
+        // Sled-execution budget: tight ceiling above the measured EMU
+        // baseline (90 sysclks 2026-05-06).  500 = ~5.5× headroom; see
+        // `test_dma_pio_rx_paced_sled_on_emu` for the rationale.
+        let mut emu = run_dma_pio_sled_on_emu(SLED_DMA_PIO_TX_PACED, 500);
+        // PIO0 FLEVEL TX nibble (bits[3:0]) for SM0 must be 0.
+        let flevel = emu.mmio_read32(PIO0_BASE + 0x00C);
+        assert_eq!(
+            flevel & 0x0000_000F,
+            0,
+            "PIO0 SM0 TX FIFO must be empty after drain spin (FLEVEL=0x{:08X})",
+            flevel,
+        );
+        // DMA INTR bit 0 must be set.
+        assert_ne!(
+            emu.mmio_read32(DMA_INTR) & 0x0000_0001,
+            0,
+            "DMA INTR bit 0",
+        );
+        // CH0 BUSY must be clear.
+        assert_eq!(
+            emu.mmio_read32(DMA_BASE + 0x0C) & 0x0400_0000,
+            0,
+            "CH0 BUSY must be clear",
+        );
+        // Pacing-drift regression band.  EMU baseline 2026-05-06 = 90
+        // sysclks; ±10 cycles (80..=100) catches drift without silicon.
+        let cycles = emu.cycles();
+        assert!(
+            (80..=100).contains(&cycles),
+            "dma_pio_tx_paced EMU sysclks {cycles} drifted out of expected band 80..=100",
         );
     }
 
