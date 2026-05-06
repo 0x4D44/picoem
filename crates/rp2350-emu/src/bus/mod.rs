@@ -1194,8 +1194,14 @@ impl Bus {
         self.raise_irqs_u64(ext_irqs);
 
         // DMA ticks after peripherals produce DREQ (HLD V5 §5.6).
+        // Loop once per advanced sysclk so DMA throughput tracks the
+        // step quantum (HLD 2026.05.06 §3 — "DMA pacing within step
+        // quantum"); pre-fix DMA was ticked exactly once regardless of
+        // sys_clks, capping throughput at 1/quantum.
         if !self.is_held_in_reset_bit(RESET_DMA) {
-            self.tick_dma();
+            for _ in 0..sys_clks {
+                self.tick_dma();
+            }
         }
 
         // WATCHDOG countdown — one cycle per `tick_peripherals` invocation

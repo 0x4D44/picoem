@@ -2208,7 +2208,7 @@ dependencies = [
 
 [[package]]
 name = "rp2040-emu"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "picoem-common",
  "picoem-devices",
@@ -2230,7 +2230,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-emu"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "picoem-common",
  "sha2",

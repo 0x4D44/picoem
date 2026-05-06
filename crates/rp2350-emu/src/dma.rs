@@ -1849,4 +1849,267 @@ mod tests {
         let matches = count_warns_containing(&events, "SNIFF_DATA");
         assert_eq!(matches, 1, "got {:?}", *events);
     }
+
+    // ----------------------------------------------------------------
+    // DMA pacing within a step quantum (HLD 2026.05.06 §4.1).
+    //
+    // `Bus::tick_peripherals(sys_clks)` advances every other peripheral
+    // by `sys_clks` cycles in one batch.  Pre-fix DMA was ticked exactly
+    // once regardless of `sys_clks`, capping DMA throughput at 1/quantum
+    // sysclks.  These six tests gate the §3 fix: tests 1–4 must FAIL on
+    // unchanged code; 5–6 must PASS as guards against future regressions.
+    // ----------------------------------------------------------------
+
+    /// Test 1: FORCE pacing throughput — N transfers in N cycles.
+    /// Catches "DMA still ticked once per quantum" — the basic regression.
+    #[test]
+    fn tick_peripherals_drains_one_transfer_per_sysclk_force() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        let src: u32 = 0x2000_0100;
+        let dst: u32 = 0x2000_0300;
+        for i in 0..64u32 {
+            bus.write32(src + i * 4, 0xCAFE_0000 + i, 0);
+        }
+
+        bus.write32(DMA_BASE, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 64, 0);
+        let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
+
+        bus.tick_peripherals(64);
+
+        for i in 0..64u32 {
+            assert_eq!(bus.read32(dst + i * 4, 0), 0xCAFE_0000 + i, "word {i}");
+        }
+        assert_eq!(bus.read32(DMA_BASE + 0x0C, 0) & CTRL_BUSY, 0);
+    }
+
+    /// Test 2: Timer pacing rate accuracy.  TIMER0 X=1, Y=10 produces ~10
+    /// transfers per 100 cycles.  Catches accumulator-state caching bugs
+    /// (e.g. "someone hoisted timer advance outside the loop"); without
+    /// the fix this completes 1 transfer in 100 cycles, not 10.
+    #[test]
+    fn tick_peripherals_advances_dma_timer_per_sysclk() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        bus.write32(DMA_BASE + 0x440, (1 << 16) | 10, 0); // TIMER0: X=1 Y=10
+
+        let src: u32 = 0x2000_0100;
+        let dst: u32 = 0x2000_0300;
+        for i in 0..16u32 {
+            bus.write32(src + i * 4, 0x1000 + i, 0);
+        }
+        bus.write32(DMA_BASE, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 16, 0);
+        // TREQ_SEL=59 (0x3B) = DREQ_TIMER0
+        let ctrl = make_ctrl(true, 2, true, true, 59, 0, 0, false);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
+
+        bus.tick_peripherals(100);
+
+        // 100 sysclks at 1/10 rate ⇒ 10 transfers fired. 6 remaining.
+        let intr = bus.read32(DMA_BASE + REG_INTR, 0);
+        assert_eq!(intr & 1, 0, "channel must still be in flight");
+        let busy = bus.read32(DMA_BASE + 0x0C, 0) & CTRL_BUSY;
+        assert_ne!(busy, 0);
+        for i in 0..10u32 {
+            assert_eq!(bus.read32(dst + i * 4, 0), 0x1000 + i, "word {i}");
+        }
+        assert_eq!(bus.read32(dst + 10 * 4, 0), 0, "word 10 must be untouched");
+    }
+
+    /// Test 3: PIO RX pacing — DREQ feedback inside the loop.  Pre-fill
+    /// PIO0 SM0 RX FIFO with 4 words (RX FIFO depth = 4 by default), arm
+    /// CH0 with TREQ_SEL=DREQ_PIO0_RX0 and TRANS_COUNT=16, run
+    /// `tick_peripherals(64)`.  PIO0 SM0 stays disabled (SM-disabled is
+    /// the default at `PioBlock::new()`) so the FIFO does not refill.
+    /// Expect exactly 4 transfers (FIFO empty after the 4th); BUSY remains.
+    /// Catches `collect_dreqs` caching outside the loop — without
+    /// per-cycle re-snapshot DMA would either drain past empty (reading
+    /// zeros for 16 transfers) or stop on cycle 1.
+    #[test]
+    fn tick_peripherals_pio_rx_dreq_feedback_per_sysclk() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        // Pre-fill PIO0 SM0 RX FIFO with 4 words (default depth).
+        for i in 0..4u32 {
+            assert!(
+                bus.pio[0].push_rx(0, 0xBEEF_0000 + i),
+                "RX FIFO must accept 4 words at default depth"
+            );
+        }
+
+        // Source addr = PIO0 RXF0 MMIO at PIO0_BASE + 0x020 (no incr).
+        // PIO0_BASE on RP2350 is 0x5020_0000 (from existing harness sleds).
+        let pio0_rxf0: u32 = 0x5020_0000 + 0x020;
+        let dst: u32 = 0x2000_0300;
+        bus.write32(DMA_BASE, pio0_rxf0, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 16, 0);
+        // TREQ_SEL=4 = DREQ_PIO0_RX0; INCR_READ=0 (sourced from FIFO MMIO).
+        let ctrl = make_ctrl(true, 2, false, true, 4, 0, 0, false);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
+
+        bus.tick_peripherals(64);
+
+        // Exactly 4 transfers should have happened (FIFO emptied; SM
+        // disabled so no refill).
+        for i in 0..4u32 {
+            assert_eq!(
+                bus.read32(dst + i * 4, 0),
+                0xBEEF_0000 + i,
+                "drained word {i}"
+            );
+        }
+        assert_eq!(
+            bus.read32(dst + 4 * 4, 0),
+            0,
+            "no transfer past the 4th — DREQ must gate cycle 5"
+        );
+        // BUSY remains: 16 - 4 = 12 transfers still pending.
+        let busy = bus.read32(DMA_BASE + 0x0C, 0) & CTRL_BUSY;
+        assert_ne!(busy, 0, "channel must remain BUSY (12 transfers left)");
+        // INTR must NOT be latched yet.
+        let intr = bus.read32(DMA_BASE + REG_INTR, 0);
+        assert_eq!(intr & 1, 0, "INTR bit 0 must not be set yet");
+    }
+
+    /// Test 4: Chain trigger fires mid-quantum.  CH0 TRANS_COUNT=4
+    /// CHAIN_TO=1; CH1 pre-programmed via AL1 (no trigger), TRANS_COUNT=4.
+    /// Run `tick_peripherals(8)` once.  Both channels complete, both
+    /// INTR bits set, both destinations populated.  Catches "chain only
+    /// fires on the next quantum boundary."
+    #[test]
+    fn tick_peripherals_chain_fires_mid_quantum() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        // CH0: copy 4 words from src0 to dst0, chain to CH1.
+        let src0: u32 = 0x2000_0100;
+        let dst0: u32 = 0x2000_0200;
+        for i in 0..4u32 {
+            bus.write32(src0 + i * 4, 0xAAAA_0000 + i, 0);
+        }
+        bus.write32(DMA_BASE, src0, 0);
+        bus.write32(DMA_BASE + 0x04, dst0, 0);
+        bus.write32(DMA_BASE + 0x08, 4, 0);
+        let ctrl0 = make_ctrl(true, 2, true, true, 63, 1, 0, false);
+
+        // CH1: pre-program via AL1 (offset 0x40 + 0x10 for AL1_CTRL — does
+        // NOT trigger).  Self-chain so CH1 doesn't chain back into another
+        // channel.
+        let src1: u32 = 0x2000_0300;
+        let dst1: u32 = 0x2000_0400;
+        for i in 0..4u32 {
+            bus.write32(src1 + i * 4, 0xBBBB_0000 + i, 0);
+        }
+        bus.write32(DMA_BASE + 0x40, src1, 0); // CH1 READ_ADDR
+        bus.write32(DMA_BASE + 0x40 + 0x04, dst1, 0); // CH1 WRITE_ADDR
+        bus.write32(DMA_BASE + 0x40 + 0x08, 4, 0); // CH1 TRANS_COUNT
+        let ctrl1 = make_ctrl(true, 2, true, true, 63, 1, 0, false);
+        bus.write32(DMA_BASE + 0x40 + 0x10, ctrl1, 0); // CH1 AL1_CTRL (no trig)
+
+        // Now arm CH0.
+        bus.write32(DMA_BASE + 0x0C, ctrl0, 0);
+
+        // 8 sysclks ⇒ 4 (CH0) + 4 (CH1 via chain) transfers.
+        bus.tick_peripherals(8);
+
+        for i in 0..4u32 {
+            assert_eq!(bus.read32(dst0 + i * 4, 0), 0xAAAA_0000 + i, "ch0 word {i}");
+            assert_eq!(bus.read32(dst1 + i * 4, 0), 0xBBBB_0000 + i, "ch1 word {i}");
+        }
+        // Both BUSY bits clear.
+        assert_eq!(bus.read32(DMA_BASE + 0x0C, 0) & CTRL_BUSY, 0, "ch0 BUSY clear");
+        assert_eq!(
+            bus.read32(DMA_BASE + 0x40 + 0x0C, 0) & CTRL_BUSY,
+            0,
+            "ch1 BUSY clear"
+        );
+        // Both INTR bits latched.
+        let intr = bus.read32(DMA_BASE + REG_INTR, 0);
+        assert_ne!(intr & (1 << 0), 0, "ch0 INTR latched");
+        assert_ne!(intr & (1 << 1), 0, "ch1 INTR latched");
+    }
+
+    /// Test 5: `sys_clks=0` does nothing.
+    ///
+    /// Pre-fix this failed because `Bus::tick_peripherals` called
+    /// `tick_dma()` unconditionally — `sys_clks=0` still issued one
+    /// transfer. Post-fix the `for _ in 0..0` empty loop is what makes
+    /// this assertion hold. Not a "no-op guard"; a real fix-path gate.
+    #[test]
+    fn tick_peripherals_zero_sysclks_does_nothing() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        let src: u32 = 0x2000_0100;
+        let dst: u32 = 0x2000_0300;
+        bus.write32(src, 0xCAFE_BABE, 0);
+
+        bus.write32(DMA_BASE, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
+        let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
+
+        bus.tick_peripherals(0);
+
+        // No transfer: dst still zero.
+        assert_eq!(bus.read32(dst, 0), 0, "no transfer at sys_clks=0");
+        // BUSY still set.
+        assert_ne!(
+            bus.read32(DMA_BASE + 0x0C, 0) & CTRL_BUSY,
+            0,
+            "BUSY must remain set"
+        );
+    }
+
+    /// Test 6: DMA in reset is silent.  RESETS_RESET bit 2 set + armed
+    /// channel + `tick_peripherals(64)` ⇒ no transfers, BUSY unchanged.
+    /// Guards the `is_held_in_reset_bit` gate.
+    #[test]
+    fn tick_peripherals_dma_in_reset_is_silent() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        let src: u32 = 0x2000_0100;
+        let dst: u32 = 0x2000_0300;
+        for i in 0..4u32 {
+            bus.write32(src + i * 4, 0xDEAD_0000 + i, 0);
+        }
+        bus.write32(DMA_BASE, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 4, 0);
+        let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
+
+        // Verify channel is BUSY before holding DMA in reset.
+        assert_ne!(
+            bus.read32(DMA_BASE + 0x0C, 0) & CTRL_BUSY,
+            0,
+            "channel must be BUSY before reset"
+        );
+
+        // Hold DMA in reset via the SET alias (offset 0x2000) on RESETS.
+        // RESETS base = 0x4002_0000; RESET_DMA = bit 2.
+        bus.write32(0x4002_0000 + 0x2000, 1u32 << crate::bus::RESET_DMA, 0);
+
+        bus.tick_peripherals(64);
+
+        // No transfer: dst untouched.
+        for i in 0..4u32 {
+            assert_eq!(
+                bus.read32(dst + i * 4, 0),
+                0,
+                "no transfer while DMA held in reset (word {i})"
+            );
+        }
+    }
 }
