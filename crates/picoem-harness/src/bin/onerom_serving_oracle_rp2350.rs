@@ -27,7 +27,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use picoem_harness::onerom_fixture::FixtureSpec;
-use picoem_harness::{onerom_glue_dma, onerom_serving_oracle, onerom_sync};
+use picoem_harness::{onerom_serving_oracle, onerom_sync};
 use rp2350_emu::{Config, EmulatorBuilder};
 
 const BOOTROM_PATH: &str = "roms/rp2350/bootrom-combined.bin";
@@ -96,7 +96,6 @@ fn main() -> ExitCode {
     // Step to sync.
     let mut sync_cycle: Option<u64> = None;
     let mut sync_report: Option<onerom_sync::SyncReport> = None;
-    let mut glue = onerom_glue_dma::GlueDma::new();
 
     while emu.cycles() < BOOT_CYCLE_CAP {
         let before = emu.cycles();
@@ -143,9 +142,8 @@ fn main() -> ExitCode {
     };
     println!("fixture: {} ({}-pin)", spec.label, spec.chip_pins);
 
-    // Prime the DMA and capture the SRAM shadow.
-    glue.prime_after_sync(&mut emu.bus);
-
+    // Capture the SRAM shadow. The real DMA peripheral now drives the
+    // serving chain on its own — no harness-side priming needed.
     let mut oracle =
         onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, spec.clone(), &flash);
 
@@ -198,7 +196,7 @@ fn main() -> ExitCode {
     let mut wall_us: Vec<f64> = Vec::with_capacity(total);
     for (idx, case) in cases.iter().enumerate() {
         let t0 = Instant::now();
-        let result = oracle.run_case(&mut emu, &mut glue, *case);
+        let result = oracle.run_case(&mut emu, *case);
         let elapsed_us = t0.elapsed().as_nanos() as f64 / 1000.0;
         wall_us.push(elapsed_us);
         let verdict_str = format_verdict_short(&result.verdict);

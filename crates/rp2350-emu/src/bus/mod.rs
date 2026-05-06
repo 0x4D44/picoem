@@ -3339,6 +3339,19 @@ impl Bus {
         dma.route_irqs(&self.atomics);
         self.dma = dma;
     }
+
+    /// Test-only: snapshot the most recent transfer-completion event
+    /// for DMA channel `ch_idx`. Forwards to
+    /// [`crate::dma::Dma::channel_transfer_event`]; see the inner
+    /// method for the reader contract. Gated behind `testing` so
+    /// release builds don't expose the bookkeeping.
+    #[cfg(feature = "testing")]
+    pub fn dma_channel_transfer_event(
+        &self,
+        ch_idx: usize,
+    ) -> crate::dma::ChannelTransferEvent {
+        self.dma.channel_transfer_event(ch_idx)
+    }
 }
 
 impl Default for Bus {

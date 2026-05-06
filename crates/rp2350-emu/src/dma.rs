@@ -259,6 +259,35 @@ impl DmaChannel {
     }
 }
 
+/// Test-only observable: snapshot of the most recent transfer issued
+/// on a channel. Updated atomically with the bus write inside
+/// [`Dma::issue_transfer`]. Behind `#[cfg(feature = "testing")]` so
+/// release builds don't ship the field.
+///
+/// The reader contract: pair `push_count` (a monotonically-increasing
+/// edge detector) with `last_src_addr` (the source address that
+/// produced the just-completed transfer, captured before any
+/// post-transfer increment). Sampling both in the same observation
+/// window yields the address that actually fed the most recent
+/// transfer — equivalent to the `(ch1_pushes, last_pushed_read_addr)`
+/// pair that the harness-side `GlueDma` previously exposed.
+///
+/// Default is `{ push_count: 0, last_src_addr: 0 }`; meaningful only
+/// after `push_count > 0`.
+#[cfg(feature = "testing")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChannelTransferEvent {
+    /// Monotonic count of completed transfers on this channel since
+    /// `Dma::reset` (or construction). Wraps on overflow.
+    pub push_count: u32,
+    /// `read_addr` value used as the source of the most recent
+    /// transfer, captured BEFORE the post-transfer increment-read
+    /// step bumps it. Reading this paired with a `push_count` edge
+    /// yields the address that produced the byte/word now visible
+    /// downstream.
+    pub last_src_addr: u32,
+}
+
 /// DMA controller state — 16 channels + global registers.
 pub struct Dma {
     channels: [DmaChannel; NUM_CHANNELS],
@@ -296,6 +325,16 @@ pub struct Dma {
     warned_sniff_ctrl_en: bool,
     /// Warn-once latch for first `SNIFF_DATA` write (HLD V5 §4.A2 site 3).
     warned_sniff_data: bool,
+    /// Test-only per-channel observable. Updated inside
+    /// [`Self::issue_transfer`] atomically with the bus write that
+    /// completes a transfer. See [`ChannelTransferEvent`] for the
+    /// reader contract; this exists solely so harness oracles can
+    /// observe push edges + the source address that produced each
+    /// push without polling MMIO between cycles (which races the
+    /// in-flight DMA pipeline). Gated behind `testing` so release
+    /// crates don't carry the bookkeeping.
+    #[cfg(feature = "testing")]
+    last_transfer_event: [ChannelTransferEvent; NUM_CHANNELS],
 }
 
 impl Default for Dma {
@@ -327,6 +366,11 @@ impl Dma {
             warned_high_priority: [false; NUM_CHANNELS],
             warned_sniff_ctrl_en: false,
             warned_sniff_data: false,
+            #[cfg(feature = "testing")]
+            last_transfer_event: [ChannelTransferEvent {
+                push_count: 0,
+                last_src_addr: 0,
+            }; NUM_CHANNELS],
         }
     }
 
@@ -375,6 +419,26 @@ impl Dma {
     /// Borrow a channel read-only (exposed for tests / observability).
     pub fn channel(&self, i: usize) -> &DmaChannel {
         &self.channels[i]
+    }
+
+    /// Test-only: snapshot the most recent transfer-completion event
+    /// for channel `ch_idx`. Returns
+    /// `ChannelTransferEvent { push_count: 0, last_src_addr: 0 }`
+    /// before the channel has issued any transfers.
+    ///
+    /// The returned `(push_count, last_src_addr)` pair is updated
+    /// atomically with the bus write inside [`Self::issue_transfer`];
+    /// callers that observe a `push_count` edge see the source
+    /// address that fed exactly that transfer (as opposed to whatever
+    /// `CH_n.READ_ADDR` MMIO holds by the time of observation, which
+    /// in chained pumps may have already advanced).
+    ///
+    /// Gated behind `testing` so release builds don't expose the
+    /// per-channel bookkeeping (matches the [`crate::Emulator::
+    /// inject_panic_for_testing`] precedent).
+    #[cfg(feature = "testing")]
+    pub fn channel_transfer_event(&self, ch_idx: usize) -> ChannelTransferEvent {
+        self.last_transfer_event[ch_idx]
     }
 
     /// Current raw interrupt-status register.
@@ -720,6 +784,24 @@ impl Dma {
             1 => bus.write8(write_addr, value as u8, 0),
             2 => bus.write16(write_addr, value as u16, 0),
             _ => bus.write32(write_addr, value, 0),
+        }
+
+        // Test-only push-event observable. Recorded inside
+        // `issue_transfer` synchronously with the bus write that
+        // completes the transfer, BEFORE the increment-read step
+        // bumps `read_addr`. Harness oracles read the pair
+        // `(push_count, last_src_addr)` to detect a push edge and
+        // recover the source address atomically — a guarantee that
+        // polling `CH_n.READ_ADDR` MMIO from outside the DMA cannot
+        // make, because CH0 in a chained pump may already have
+        // advanced READ_ADDR by the time the harness samples.
+        #[cfg(feature = "testing")]
+        {
+            let prev = self.last_transfer_event[ch_idx].push_count;
+            self.last_transfer_event[ch_idx] = ChannelTransferEvent {
+                push_count: prev.wrapping_add(1),
+                last_src_addr: read_addr,
+            };
         }
 
         // Update addresses.
@@ -2185,6 +2267,84 @@ mod tests {
             bus.atomics.irq_pending_load(1) & (1u64 << IRQ_DMA_IRQ_0),
             0,
             "IRQ_DMA_IRQ_0 must be asserted via INTF0 force-IRQ even when DMA is otherwise idle (core 1)"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Test-only: per-channel push-event observable.
+    //
+    // Replaces the old harness-side `GlueDma::ch1_pushes()` /
+    // `GlueDma::last_pushed_read_addr()` pair with an in-DMA hook
+    // that records the source address atomically with the bus write
+    // that completes a transfer. See `ChannelTransferEvent` doc for
+    // the reader contract; the harness oracle pairs `push_count` and
+    // `last_src_addr` to identify which transfer fed the byte
+    // currently visible downstream.
+    // ----------------------------------------------------------------
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn channel_transfer_event_default_is_zero() {
+        let dma = Dma::new();
+        for ch_idx in 0..NUM_CHANNELS {
+            let ev = dma.channel_transfer_event(ch_idx);
+            assert_eq!(ev.push_count, 0);
+            assert_eq!(ev.last_src_addr, 0);
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn channel_transfer_event_records_push_and_source_address() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        // 3-word mem-to-mem transfer with INCR_READ — we want to
+        // observe that `last_src_addr` is the PRE-increment address
+        // for the most recent transfer.
+        let src: u32 = 0x2000_1000;
+        let dst: u32 = 0x2000_2000;
+        for i in 0..3u32 {
+            bus.write32(src + i * 4, 0xC0DE_0000 | i, 0);
+        }
+        bus.write32(DMA_BASE, src, 0);
+        bus.write32(DMA_BASE + 0x04, dst, 0);
+        bus.write32(DMA_BASE + 0x08, 3, 0);
+        let ctrl = make_ctrl(true, 2, true, true, 63, 0, 0, false);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
+
+        // Pre-tick: still no transfers issued.
+        let ev = bus.dma_channel_transfer_event(0);
+        assert_eq!(ev.push_count, 0, "no transfers before tick");
+        assert_eq!(ev.last_src_addr, 0);
+
+        // First tick: one transfer issued, source = src.
+        bus.tick_dma();
+        let ev = bus.dma_channel_transfer_event(0);
+        assert_eq!(ev.push_count, 1);
+        assert_eq!(
+            ev.last_src_addr, src,
+            "last_src_addr must be the PRE-increment source of the transfer"
+        );
+
+        // Second tick: source = src + 4.
+        bus.tick_dma();
+        let ev = bus.dma_channel_transfer_event(0);
+        assert_eq!(ev.push_count, 2);
+        assert_eq!(ev.last_src_addr, src + 4);
+
+        // Third tick: source = src + 8.
+        bus.tick_dma();
+        let ev = bus.dma_channel_transfer_event(0);
+        assert_eq!(ev.push_count, 3);
+        assert_eq!(ev.last_src_addr, src + 8);
+
+        // Fourth tick: TRANS_COUNT exhausted, no transfer issued.
+        bus.tick_dma();
+        let ev = bus.dma_channel_transfer_event(0);
+        assert_eq!(
+            ev.push_count, 3,
+            "push_count must not advance once TRANS_COUNT is exhausted"
         );
     }
 }

@@ -30,7 +30,15 @@ use std::sync::atomic::Ordering;
 use rp2350_emu::{Bus, Emulator};
 
 use crate::onerom_fixture::{FixtureError, FixtureSpec, lift_shadow_from_flash};
-use crate::onerom_glue_dma::{DMA_READ_CYCLES, DMA_WRITE_CYCLES, GlueDma};
+
+// DMA pipeline constants previously sourced from
+// `crate::onerom_glue_dma`. Retained as local module constants
+// because `MIN_FRESH_ARRIVAL_CYCLE` (the post-push fresh-byte arrival
+// floor used by the trace evaluator) was derived from them. The
+// numeric values match the real-DMA model the emulator implements
+// for the OneROM serving pipeline (4-cycle read + 4-cycle write).
+const DMA_READ_CYCLES: u8 = 4;
+const DMA_WRITE_CYCLES: u8 = 4;
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -341,9 +349,14 @@ pub(crate) struct Observation {
     /// Cycles elapsed since this case's `cs_low_cycle` (the `cs_assert`
     /// transition). The first observation has `cycle == 0`.
     pub cycle: u64,
-    /// `GlueDma::ch1_pushes()` sampled this cycle.
+    /// `Bus::dma_channel_transfer_event(1).push_count` sampled this
+    /// cycle, expressed as a delta relative to the pre-window snapshot
+    /// captured by `run_case`.
     pub ch1_pushes: u32,
-    /// `bus.read32(CH1.READ_ADDR, 0)` sampled this cycle.
+    /// `Bus::dma_channel_transfer_event(1).last_src_addr` sampled this
+    /// cycle — the source address that produced the most recent push,
+    /// captured atomically with the push-count increment inside
+    /// `Dma::issue_transfer`.
     pub resolved_addr: u32,
     /// Byte currently exposed on D0..D7 (`(gpio_in >> spec.data_pins[0]) & 0xFF` —
     /// the data pins are contiguous on supported fixtures).
@@ -464,8 +477,9 @@ impl ServingOracle {
         self.results.push(r);
     }
 
-    /// Drive one case end-to-end. Steps the emulator and pumps the glue
-    /// DMA; records per-cycle observations; runs the verdict evaluator.
+    /// Drive one case end-to-end. Steps the emulator and observes the
+    /// real DMA's per-channel push events; records per-cycle observations;
+    /// runs the verdict evaluator.
     ///
     /// State machine per HLD §4.3:
     /// - `init` (first call only): drive the gate CS + every
@@ -480,7 +494,15 @@ impl ServingOracle {
     ///   the per-tick loop builds up an `Observation` vector for at
     ///   most `PER_CASE_TIMEOUT` cycles. At the end (or on early stable-
     ///   byte detection), the trace is fed to [`evaluate_case_trace`].
-    pub fn run_case(&mut self, emu: &mut Emulator, glue: &mut GlueDma, case: Case) -> &CaseResult {
+    ///
+    /// The push-count and resolved-source-address observables come from
+    /// the real DMA peripheral via
+    /// [`Bus::dma_channel_transfer_event`] (gated behind the `testing`
+    /// feature on `rp2350-emu`). Both fields are updated atomically
+    /// inside `Dma::issue_transfer`, so sampling them in the same
+    /// observation cycle pairs a push edge with the source address
+    /// that fed exactly that transfer.
+    pub fn run_case(&mut self, emu: &mut Emulator, case: Case) -> &CaseResult {
         // External-input mask covers gate CS (cs1 today on fire-24-a),
         // every deasserted-high CS pin, every asserted-low pin, and all
         // address pins. Data pins are PIO-driven; never mask them.
@@ -506,7 +528,7 @@ impl ServingOracle {
             emu.bus
                 .gpio_external_in_hi
                 .store((seed_level >> 32) as u32, Ordering::Relaxed);
-            self.tick_cycles(emu, glue, SEED_CYCLES);
+            self.tick_cycles(emu, SEED_CYCLES);
             self.seed_done = true;
         }
 
@@ -529,7 +551,7 @@ impl ServingOracle {
         emu.bus
             .gpio_external_in_hi
             .store((gap_level >> 32) as u32, Ordering::Relaxed);
-        self.tick_cycles(emu, glue, GAP_CYCLES);
+        self.tick_cycles(emu, GAP_CYCLES);
 
         // 3. cs_assert: apply the case stimulus.
         let stim_level: u64 = self.compose_stim_level(&case);
@@ -546,7 +568,14 @@ impl ServingOracle {
         // to this snapshot; the evaluator then uses the delta to detect
         // per-cycle push edges (for skipping gap pushes that slip in
         // during the observation window).
-        let pushes_before = glue.ch1_pushes();
+        //
+        // `push_count` comes from the real DMA peripheral's test-only
+        // `ChannelTransferEvent`, updated inside `Dma::issue_transfer`
+        // atomically with the bus write that completes a transfer.
+        // It wraps on overflow per `wrapping_add`; the per-cycle delta
+        // computed below is robust as long as the wrap-window is wider
+        // than `PER_CASE_TIMEOUT` (it is — u32 vs ~60 cycles per case).
+        let pushes_before = emu.bus.dma_channel_transfer_event(1).push_count;
 
         // Data-pin base — the data pins are contiguous on every supported
         // fixture (fire-24-a: GPIO 16..23; fire-32-a: GPIO 0..7). Use
@@ -558,21 +587,22 @@ impl ServingOracle {
         let mut trace: Vec<Observation> = Vec::with_capacity(PER_CASE_TIMEOUT as usize);
         for c in 0..PER_CASE_TIMEOUT {
             emu.run(1).expect("Serial run is infallible");
-            glue.tick(&mut emu.bus);
 
-            // Plain subtraction — `glue.ch1_pushes()` is monotonic on a
-            // single GlueDma, so an underflow here is a true invariant
-            // violation we want to surface, not silently mask.
-            let pushes = glue.ch1_pushes() - pushes_before;
-            // H1 fix: `resolved_addr` comes from the glue DMA's saved
-            // `last_pushed_read_addr`, updated atomically with the push
-            // counter in `tick_ch1`. Reading `CH1.READ_ADDR` MMIO here
-            // raced CH0's subsequent writes — by the time the oracle
-            // observed a push edge, CH0 may already have deposited the
-            // NEXT address, so the MMIO value reported an address that
-            // never produced the observed byte. See H1 in the Stage G
-            // fix-wave brief (2026-04-17).
-            let resolved = glue.last_pushed_read_addr();
+            // Pair-sample the push counter and the source address that
+            // produced the most recent transfer. Both fields are
+            // updated atomically inside `Dma::issue_transfer` (HLD
+            // §3.2 — the test-only `ChannelTransferEvent`), so a
+            // push-count edge and the matching `last_src_addr` arrive
+            // together. This closes the same race that the harness's
+            // GlueDma `last_pushed_read_addr` field closed pre-Stage 5
+            // (see H1 in the Stage G fix-wave brief, 2026-04-17): a
+            // direct `CH1.READ_ADDR` MMIO poll loses the produce-vs-
+            // consume race against CH0's subsequent writes.
+            let event = emu.bus.dma_channel_transfer_event(1);
+            // `wrapping_sub` defends against the (unreachable in
+            // practice) u32 wrap inside a single case window.
+            let pushes = event.push_count.wrapping_sub(pushes_before);
+            let resolved = event.last_src_addr;
             let data_byte = ((emu.bus.gpio_in.load(Ordering::Relaxed) >> data_base) & 0xFF) as u8;
             let pad_oe = ((emu.bus.pio[2].pad_oe >> data_base) & 0xFF) as u8;
 
@@ -858,7 +888,7 @@ impl ServingOracle {
         // --- Emulator-bounded caveat (HLD §5.4, verbatim) ----------------
         let _ = writeln!(
             out,
-            "  Latency measured against the emulator's glue DMA + PIO model"
+            "  Latency measured against the emulator's DMA + PIO model"
         );
         let _ = writeln!(
             out,
@@ -873,13 +903,12 @@ impl ServingOracle {
         out
     }
 
-    /// Advance `emu` by `n` cycles, pumping the glue DMA each cycle.
-    /// Used for the seed and gap phases, which don't need to record
-    /// observations.
-    fn tick_cycles(&self, emu: &mut Emulator, glue: &mut GlueDma, n: u32) {
+    /// Advance `emu` by `n` cycles. Used for the seed and gap phases,
+    /// which don't need to record observations. The real DMA peripheral
+    /// drives the chain; no harness-side pump is needed.
+    fn tick_cycles(&self, emu: &mut Emulator, n: u32) {
         for _ in 0..n {
             emu.run(1).expect("Serial run is infallible");
-            glue.tick(&mut emu.bus);
         }
     }
 
@@ -2402,7 +2431,7 @@ mod tests {
         );
 
         assert!(
-            report.contains("glue DMA + PIO model"),
+            report.contains("DMA + PIO model"),
             "missing emulator-bounded caveat: {}",
             report
         );

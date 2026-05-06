@@ -18,7 +18,7 @@ workspace = true
 [dependencies]
 picoem-common = { path = "../picoem-common", features = ["pio-pad-diag"] }
 picoem-devices = { path = "../picoem-devices" }
-rp2350-emu = { path = "../rp2350-emu", features = ["threading"] }
+rp2350-emu = { path = "../rp2350-emu", features = ["threading", "testing"] }
 rp2040-emu = { path = "../rp2040-emu", features = ["threading"] }
 probe-rs = "0.31"
 rand = "0.8"

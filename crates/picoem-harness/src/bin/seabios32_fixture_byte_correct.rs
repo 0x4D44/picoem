@@ -56,7 +56,7 @@ use std::time::Instant;
 
 use picoem_harness::onerom_fixture::FixtureSpec;
 use picoem_harness::onerom_serving_oracle::{Case, CaseResult, ServingOracle, Verdict};
-use picoem_harness::{onerom_glue_dma, onerom_sync};
+use picoem_harness::onerom_sync;
 use rp2350_emu::{Config, Emulator, EmulatorBuilder};
 
 const BOOTROM_PATH: &str = "roms/rp2350/bootrom-combined.bin";
@@ -509,9 +509,6 @@ fn main() -> ExitCode {
         pio2_fstat
     );
 
-    let mut glue = onerom_glue_dma::GlueDma::new();
-    glue.prime_after_sync(&mut emu.bus);
-
     let mut oracle = ServingOracle::new_at_sync(&mut emu.bus, spec.clone(), &flash);
     oracle.populate_sram_from_shadow(&mut emu.bus);
 
@@ -583,7 +580,7 @@ fn main() -> ExitCode {
         // content.
         let expected = seabios[expected_seabios_offset(addr_idx, seabios.len())];
 
-        let result = oracle.run_case(&mut emu, &mut glue, case);
+        let result = oracle.run_case(&mut emu, case);
         let result_copy = *result;
         match classify(&result_copy, expected) {
             ResultKind::Pass => tally.pass += 1,

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 
-use picoem_harness::{onerom_glue_dma, onerom_snapshot_fmt, onerom_sync};
+use picoem_harness::{onerom_snapshot_fmt, onerom_sync};
 use rp2350_emu::{Config, EmulatorBuilder};
 
 const BOOTROM_PATH: &str = "roms/rp2350/bootrom-combined.bin";
@@ -208,8 +208,13 @@ fn main() -> ExitCode {
     // boot cycle cap and this is a diagnostic run, not production.
     let mut synced_at: Option<u64> = None;
     let mut sync_report: Option<onerom_sync::SyncReport> = None;
-    let mut glue_dma = onerom_glue_dma::GlueDma::new();
     let mut wfi_loop_hits: u32 = 0;
+    // Snapshot of the real DMA's CH1 push-count at sync time. Used to
+    // compute the post-sync push delta below, replacing the harness's
+    // GlueDma::ch1_pushes() observable (which was a duplicate of the
+    // real DMA's `ChannelTransferEvent.push_count`, exposed via
+    // `Bus::dma_channel_transfer_event` behind the `testing` feature).
+    let mut ch1_pushes_at_sync: u32 = 0;
 
     // Post-sync observation log: (relative cycle, data_byte, pio2_oe_data_mask).
     let mut obs_log: Vec<(u64, u8, u8)> = Vec::new();
@@ -302,7 +307,12 @@ fn main() -> ExitCode {
             synced_at = Some(after_cycles);
             sync_detect_cycle = Some(after_cycles);
             let report = onerom_sync::capture_snapshot(&mut emu.bus, after_cycles);
-            glue_dma.prime_after_sync(&mut emu.bus);
+            // Capture the real DMA's CH1 push count so the post-sync
+            // delta below is a clean count of pushes inside the
+            // observation window. The real DMA peripheral is now the
+            // single source of truth — the previous glue-DMA prime
+            // is no longer required.
+            ch1_pushes_at_sync = emu.bus.dma_channel_transfer_event(1).push_count;
             sync_report = Some(report);
 
             // Install external-input stimulus: CS1 low, CS2/CS3 high,
@@ -327,10 +337,9 @@ fn main() -> ExitCode {
                 .store(stim_level, Ordering::Relaxed);
         }
 
-        // Post-sync: pump the glue DMA and log observations (F.4).
+        // Post-sync: log observations (F.4). The real DMA peripheral
+        // drives the chain on its own; no harness-side pump required.
         if let Some(sync_cycle) = sync_detect_cycle {
-            glue_dma.tick(&mut emu.bus);
-
             let rel_cycle = after_cycles.saturating_sub(sync_cycle);
             let data_byte =
                 ((emu.bus.gpio_in.load(Ordering::Relaxed) >> GPIO_DATA_BASE) & 0xFF) as u8;
@@ -471,7 +480,15 @@ fn main() -> ExitCode {
             "POST-SYNC OBSERVATIONS ({} cycles, columns: rel_cycle data_byte pio2_oe_data):",
             obs_log.len()
         );
-        let ch1_pushes = glue_dma.ch1_pushes();
+        // Delta from the snapshot taken at sync — counts only pushes
+        // produced inside the post-sync observation window.
+        // `wrapping_sub` defends against u32 wrap (theoretical only;
+        // observation windows are well under 2^32 cycles).
+        let ch1_pushes = emu
+            .bus
+            .dma_channel_transfer_event(1)
+            .push_count
+            .wrapping_sub(ch1_pushes_at_sync);
         let verdict = evaluate_smoke_test(&obs_log, ch1_pushes);
         for (cyc, byte, oe) in &obs_log {
             println!(
@@ -480,7 +497,7 @@ fn main() -> ExitCode {
             );
         }
         println!();
-        println!("  glue DMA CH1 pushes during observation: {}", ch1_pushes);
+        println!("  DMA CH1 pushes during observation: {}", ch1_pushes);
         match verdict {
             SmokeVerdict::Pass { byte, start, end } => {
                 println!(

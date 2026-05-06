@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use picoem_harness::{onerom_glue_dma, onerom_serving_oracle, onerom_stress, onerom_sync};
+use picoem_harness::{onerom_serving_oracle, onerom_stress, onerom_sync};
 use rp2350_emu::{Config, Emulator, EmulatorBuilder};
 
 // ---------------------------------------------------------------------------
@@ -158,20 +158,13 @@ fn parse_cli() -> Result<Cli, String> {
 
 /// Load bootrom / flash, reset, halt core 1, step serially until the
 /// `is_synced` predicate (both PIO1 and PIO2 SMs enabled) fires. Then
-/// prime the glue DMA and populate SRAM from the lifted shadow. Returns
-/// the synced emulator, the primed glue, and the oracle.
+/// populate SRAM from the lifted shadow. Returns the synced emulator
+/// and the oracle.
 fn boot_sync(
     bootrom: &[u8],
     flash: &[u8],
     spec: &picoem_harness::onerom_fixture::FixtureSpec,
-) -> Result<
-    (
-        Emulator,
-        onerom_glue_dma::GlueDma,
-        onerom_serving_oracle::ServingOracle,
-    ),
-    String,
-> {
+) -> Result<(Emulator, onerom_serving_oracle::ServingOracle), String> {
     // Up-front shadow-lift sanity check: confirm the hardcoded ROM set
     // parses out of the fixture. None here is a loud early signal that
     // the fixture / ROM_SET_INDEX pair is wrong.
@@ -202,7 +195,6 @@ fn boot_sync(
     emu.core_mut(1).halt();
 
     // Step to PIO sync (both PIO blocks' SMs enabled).
-    let mut glue = onerom_glue_dma::GlueDma::new();
     let mut sync_cycle: Option<u64> = None;
     while emu.cycles() < BOOT_CYCLE_CAP {
         let before = emu.cycles();
@@ -223,13 +215,13 @@ fn boot_sync(
         ));
     }
 
-    // Prime DMA + oracle after sync.
-    glue.prime_after_sync(&mut emu.bus);
+    // Build the oracle after sync. The real DMA peripheral drives the
+    // serving chain — no harness-side glue or priming required.
     let oracle =
         onerom_serving_oracle::ServingOracle::new_at_sync(&mut emu.bus, spec.clone(), flash);
     oracle.populate_sram_from_shadow(&mut emu.bus);
 
-    Ok((emu, glue, oracle))
+    Ok((emu, oracle))
 }
 
 // ---------------------------------------------------------------------------
@@ -325,8 +317,8 @@ fn main() -> ExitCode {
         }
     };
 
-    let (mut emu, mut glue, mut oracle) = match boot_sync(&bootrom, &flash, &spec) {
-        Ok(trio) => trio,
+    let (mut emu, mut oracle) = match boot_sync(&bootrom, &flash, &spec) {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("boot-sync failed: {}", e);
             return ExitCode::FAILURE;
@@ -354,7 +346,7 @@ fn main() -> ExitCode {
         // other verdicts (WrongByte carries a latency, LatencyOutOfEnvelope
         // carries one too) must be treated as errors at every rung.
         let (verdict, latency_cycles) = {
-            let result = oracle.run_case(&mut emu, &mut glue, *case);
+            let result = oracle.run_case(&mut emu, *case);
             (result.verdict, result.latency_cycles)
         };
         match verdict {
