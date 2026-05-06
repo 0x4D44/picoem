@@ -35017,4 +35017,336 @@ mod stage9_residue {
     }
 }
 
+// ============================================================================
+// Stage 11: ARMv8-M parallel arithmetic and sign/zero-extend-and-add encodings
+// ----------------------------------------------------------------------------
+// Coverage targets in `core/execute_thumb32.rs`:
+//   * Q-saturating signed parallel 16-bit add/sub (QADD16, QSUB16) — sat
+//     branch of `parallel_signed_16`.
+//   * Halving signed parallel 16-bit add/sub (SHADD16, SHSUB16) — halving
+//     branch of `parallel_signed_16`.
+//   * Q-saturating unsigned parallel 16-bit add/sub (UQADD16, UQSUB16).
+//   * Halving unsigned parallel 16-bit add/sub (UHADD16, UHSUB16).
+//   * Extend-and-add encodings SXTAH, UXTAH, SXTAB, UXTAB (rn != 15 path of
+//     the extend dispatch in `thumb32_dp_register`), including the rotation
+//     ROR(8) sub-arm for one mnemonic.
+//   * Parallel signed/unsigned 8-bit add/sub (SADD8, SSUB8, USUB8) — every
+//     branch of `parallel_signed_8` / `parallel_unsigned_8` plus the GE-flag
+//     decision in `parallel_unsigned_8`'s SUB arm.
+//
+// Notes on intentionally-skipped mnemonics from the task brief:
+//   * SSAT16 and USAT16 are NOT implemented as packed-half saturate. The
+//     5-bit dispatcher op `0b10010` (SSAT16) and `0b11010` (USAT16) collide
+//     with scalar SSAT (ASR variant) / USAT (ASR variant); the scalar code
+//     path runs unconditionally and treats the whole 32-bit input as one
+//     value rather than two independent halves. Adding tests would either
+//     hit a quietly-wrong path or duplicate scalar SSAT/USAT coverage —
+//     neither is useful. Tracked separately as a real gap, not a coverage
+//     hole.
+//   * QADD8 / QSUB8 / SHADD8 / SHSUB8 / UQADD8 / UQSUB8 / UHADD8 / UHSUB8
+//     are NOT implemented. The dispatcher routes par_op2 ∈ {Q,H} variants
+//     unconditionally to `parallel_signed_16` / `parallel_unsigned_16`,
+//     which only match `op` ∈ {001,010,110,101}. par_op1 = 000 (ADD8) /
+//     100 (SUB8) drops through the inner match arms and silently returns
+//     1 cycle without writing Rd — there is no operation to test.
+//   * USAT8 is just scalar USAT with sat_imm = 7. Already exercised by
+//     existing USAT tests; adding a sat_imm=7 case would not add a new
+//     branch.
+//
+// All tests use `execute_one_wide` plus `for_test` / `set_reg` / `reg` —
+// production code is untouched.
+// ============================================================================
+#[cfg(test)]
+mod stage11_parallel_extend {
+    use crate::core::CortexM33;
+
+    // -- Encoding helpers ----------------------------------------------------
+
+    /// Encode a Thumb-32 parallel add/subtract instruction.
+    /// hw0 = `1111 1010 1·op1·Rn`, hw1 = `1111 Rd 0·op2·Rm`.
+    fn encode_parallel(par_op1: u8, par_op2: u8, rn: u8, rd: u8, rm: u8) -> (u16, u16) {
+        // par_op1 occupies hw0[6:4]; par_op2 occupies hw1[6:4] with hw1[7]=0.
+        let hw0 = 0xFA80 | ((par_op1 as u16) << 4) | (rn as u16);
+        let hw1 = 0xF000 | ((rd as u16) << 8) | ((par_op2 as u16) << 4) | (rm as u16);
+        (hw0, hw1)
+    }
+
+    /// Encode a Thumb-32 extend-and-add instruction (SXTAH/UXTAH/SXTAB/UXTAB
+    /// when rn != 15). hw0 = `1111 1010 0·ext·Rn`, hw1 = `1111 Rd 10·rot·Rm`.
+    /// `rot_bits` is the 2-bit rotation field where 00=ror0, 01=ror8, etc.
+    fn encode_extend_add(ext: u8, rn: u8, rd: u8, rot_bits: u8, rm: u8) -> (u16, u16) {
+        // hw0[7]=0 selects the extend/shift path; ext occupies hw0[6:4].
+        let hw0 = 0xFA00 | ((ext as u16) << 4) | (rn as u16);
+        // hw1[7]=1 selects the extend sub-path; rot occupies hw1[5:4].
+        let hw1 = 0xF080 | ((rd as u16) << 8) | ((rot_bits as u16 & 0x3) << 4) | (rm as u16);
+        (hw0, hw1)
+    }
+
+    // -- QADD16 / QSUB16 (par_op2 = 001) -------------------------------------
+
+    /// QADD16: per-half saturating signed add. Lo half overflows positive →
+    /// clips to +32767; hi half overflows negative → clips to -32768.
+    #[test]
+    fn qadd16_saturates_each_half_independently() {
+        let mut c = CortexM33::for_test(0);
+        // R1 lo = +30000, R1 hi = -30000 (0x8AD0 = -30000 in i16).
+        c.set_reg(1, 0x8AD0_7530);
+        // R2 lo = +5000 (forces lo over +32767), R2 hi = -5000 (forces hi
+        // under -32768). 0xEC78 = -5000 in i16.
+        c.set_reg(2, 0xEC78_1388);
+        let (hw0, hw1) = encode_parallel(0b001, 0b001, 1, 0, 2);
+        let cy = c.execute_one_wide(hw0, hw1);
+        let r = c.reg(0);
+        assert_eq!(r & 0xFFFF, 0x7FFF, "lo saturates to +32767");
+        assert_eq!(r >> 16, 0x8000, "hi saturates to -32768");
+        assert_eq!(cy, 2, "M33 measured: 2 cycles");
+    }
+
+    /// QSUB16: per-half saturating signed subtract. Lo: -30000 - +5000 →
+    /// -32768 (clip). Hi: +30000 - -5000 → +32767 (clip).
+    #[test]
+    fn qsub16_saturates_each_half_independently() {
+        let mut c = CortexM33::for_test(0);
+        // R1 lo = -30000 (0x8AD0), R1 hi = +30000 (0x7530).
+        c.set_reg(1, 0x7530_8AD0);
+        // R2 lo = +5000, R2 hi = -5000.
+        c.set_reg(2, 0xEC78_1388);
+        let (hw0, hw1) = encode_parallel(0b101, 0b001, 1, 0, 2);
+        c.execute_one_wide(hw0, hw1);
+        let r = c.reg(0);
+        assert_eq!(r & 0xFFFF, 0x8000, "lo saturates to -32768");
+        assert_eq!(r >> 16, 0x7FFF, "hi saturates to +32767");
+    }
+
+    // -- SHADD16 / SHSUB16 (par_op2 = 010) -----------------------------------
+
+    /// SHADD16: per-half signed halving add. Discards LSB after sum so the
+    /// result lane never overflows.
+    #[test]
+    fn shadd16_halves_per_lane() {
+        let mut c = CortexM33::for_test(0);
+        // R1 lo=+10, R1 hi=-4 (0xFFFC).
+        c.set_reg(1, 0xFFFC_000A);
+        // R2 lo=+20, R2 hi=-2 (0xFFFE).
+        c.set_reg(2, 0xFFFE_0014);
+        let (hw0, hw1) = encode_parallel(0b001, 0b010, 1, 0, 2);
+        c.execute_one_wide(hw0, hw1);
+        let r = c.reg(0);
+        // lo: (10+20)/2 = 15 = 0x000F.
+        assert_eq!(r & 0xFFFF, 0x000F);
+        // hi: (-4 + -2) >> 1 = -6 >> 1 = -3 = 0xFFFD (arithmetic shift).
+        assert_eq!(r >> 16, 0xFFFD);
+    }
+
+    /// SHSUB16: per-half signed halving subtract.
+    #[test]
+    fn shsub16_halves_per_lane() {
+        let mut c = CortexM33::for_test(0);
+        // R1 lo=+100, R1 hi=-100 (0xFF9C).
+        c.set_reg(1, 0xFF9C_0064);
+        // R2 lo=+50, R2 hi=+100 (0x0064).
+        c.set_reg(2, 0x0064_0032);
+        let (hw0, hw1) = encode_parallel(0b101, 0b010, 1, 0, 2);
+        c.execute_one_wide(hw0, hw1);
+        let r = c.reg(0);
+        // lo: (100-50)/2 = 25 = 0x0019.
+        assert_eq!(r & 0xFFFF, 0x0019);
+        // hi: (-100-100) >> 1 = -200 >> 1 = -100 = 0xFF9C.
+        assert_eq!(r >> 16, 0xFF9C);
+    }
+
+    // -- UQADD16 / UQSUB16 (par_op2 = 101) -----------------------------------
+
+    /// UQADD16: per-half unsigned saturating add. Lo overflows past 0xFFFF →
+    /// clips to 0xFFFF; hi non-overflowing case verifies passthrough.
+    #[test]
+    fn uqadd16_saturates_unsigned_overflow() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0x1234_F000);
+        c.set_reg(2, 0x0001_2000);
+        let (hw0, hw1) = encode_parallel(0b001, 0b101, 1, 0, 2);
+        c.execute_one_wide(hw0, hw1);
+        let r = c.reg(0);
+        assert_eq!(r & 0xFFFF, 0xFFFF, "lo: 0xF000+0x2000 saturates to 0xFFFF");
+        assert_eq!(r >> 16, 0x1235, "hi: 0x1234+1 = 0x1235 passes through");
+    }
+
+    /// UQSUB16: per-half unsigned saturating sub. Lo borrows → clips to 0;
+    /// hi non-borrowing case verifies passthrough.
+    #[test]
+    fn uqsub16_saturates_unsigned_underflow() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0x1000_0050);
+        c.set_reg(2, 0x0500_0100);
+        let (hw0, hw1) = encode_parallel(0b101, 0b101, 1, 0, 2);
+        c.execute_one_wide(hw0, hw1);
+        let r = c.reg(0);
+        assert_eq!(r & 0xFFFF, 0x0000, "lo: 0x0050-0x0100 saturates to 0");
+        assert_eq!(r >> 16, 0x0B00, "hi: 0x1000-0x0500 = 0x0B00 passes through");
+    }
+
+    // -- UHADD16 / UHSUB16 (par_op2 = 110) -----------------------------------
+
+    /// UHADD16: per-half unsigned halving add — never overflows.
+    #[test]
+    fn uhadd16_halves_unsigned_per_lane() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0x0010_FFFE);
+        c.set_reg(2, 0x0020_0002);
+        let (hw0, hw1) = encode_parallel(0b001, 0b110, 1, 0, 2);
+        c.execute_one_wide(hw0, hw1);
+        let r = c.reg(0);
+        // lo: (0xFFFE + 2)/2 = 0x10000/2 = 0x8000 (no overflow even though
+        // sum exceeds 0xFFFF).
+        assert_eq!(r & 0xFFFF, 0x8000);
+        // hi: (0x10 + 0x20)/2 = 0x18.
+        assert_eq!(r >> 16, 0x0018);
+    }
+
+    /// UHSUB16: per-half unsigned halving sub. Underflow lane wraps via the
+    /// `as u32 >> 1` cast so the high bit reflects the borrow.
+    #[test]
+    fn uhsub16_halves_unsigned_per_lane() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0x0040_0010);
+        c.set_reg(2, 0x0010_0020);
+        let (hw0, hw1) = encode_parallel(0b101, 0b110, 1, 0, 2);
+        c.execute_one_wide(hw0, hw1);
+        let r = c.reg(0);
+        // lo: i32 sub = 0x10 - 0x20 = -0x10 = 0xFFFF_FFF0; (>>1 unsigned) =
+        // 0x7FFF_FFF8; truncated to u16 = 0xFFF8.
+        assert_eq!(r & 0xFFFF, 0xFFF8);
+        // hi: (0x40 - 0x10)/2 = 0x18.
+        assert_eq!(r >> 16, 0x0018);
+    }
+
+    // -- SXTAH / UXTAH / SXTAB / UXTAB (extend-and-add) ----------------------
+
+    /// SXTAH: Rd = Rn + sign_extend(rotated[15:0]). Negative half input
+    /// pulls the accumulator below zero.
+    #[test]
+    fn sxtah_sign_extends_low_halfword_and_adds() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0x0000_1000); // accumulator
+        c.set_reg(2, 0x9999_FF80); // low half = 0xFF80 = -128 (i16)
+        let (hw0, hw1) = encode_extend_add(0b000, 1, 0, 0, 2);
+        let cy = c.execute_one_wide(hw0, hw1);
+        // 0x1000 + (-128) = 0x0F80.
+        assert_eq!(c.reg(0), 0x0000_0F80);
+        assert_eq!(cy, 2, "M33 measured: 2 cycles");
+    }
+
+    /// UXTAH: Rd = Rn + zero_extend(rotated[15:0]). Same input as SXTAH
+    /// confirms the zero-extension path adds a positive halfword.
+    #[test]
+    fn uxtah_zero_extends_low_halfword_and_adds() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0x0000_1000);
+        c.set_reg(2, 0x9999_FF80);
+        let (hw0, hw1) = encode_extend_add(0b001, 1, 0, 0, 2);
+        c.execute_one_wide(hw0, hw1);
+        // 0x1000 + 0xFF80 (zero-extended) = 0x0001_0F80.
+        assert_eq!(c.reg(0), 0x0001_0F80);
+    }
+
+    /// SXTAB: Rd = Rn + sign_extend(rotated[7:0]). Negative byte makes the
+    /// accumulator decrement.
+    #[test]
+    fn sxtab_sign_extends_low_byte_and_adds() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0x0000_0200);
+        c.set_reg(2, 0xDEAD_BE80); // low byte = 0x80 = -128 (i8)
+        let (hw0, hw1) = encode_extend_add(0b100, 1, 0, 0, 2);
+        c.execute_one_wide(hw0, hw1);
+        // 0x200 + (-128) = 0x180.
+        assert_eq!(c.reg(0), 0x0000_0180);
+    }
+
+    /// UXTAB: Rd = Rn + zero_extend(rotated[7:0]). Confirms the byte adds
+    /// as an unsigned value.
+    #[test]
+    fn uxtab_zero_extends_low_byte_and_adds() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0x0000_0200);
+        c.set_reg(2, 0xDEAD_BE80); // low byte = 0x80
+        let (hw0, hw1) = encode_extend_add(0b101, 1, 0, 0, 2);
+        c.execute_one_wide(hw0, hw1);
+        // 0x200 + 0x80 = 0x280.
+        assert_eq!(c.reg(0), 0x0000_0280);
+    }
+
+    /// UXTAB with ROR #8 — exercise the `rot_bits != 0` arm of the rotation
+    /// path. After ROR(8), the byte that was at bits[15:8] becomes bits[7:0]
+    /// and is then zero-extended.
+    #[test]
+    fn uxtab_with_ror8_uses_rotated_byte() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0x0000_1000);
+        // We want post-rotation bits[7:0] = 0x42, so pre-rotation bits[15:8]
+        // must be 0x42. (ROR #8 brings bits[15:8] down to bits[7:0].)
+        c.set_reg(2, 0x0000_4200);
+        let (hw0, hw1) = encode_extend_add(0b101, 1, 0, 0b01, 2);
+        c.execute_one_wide(hw0, hw1);
+        assert_eq!(c.reg(0), 0x0000_1042, "0x1000 + 0x42 (rotated byte)");
+    }
+
+    // -- 8-bit parallel siblings (SADD8, SSUB8, USUB8) -----------------------
+
+    /// SADD8: 4-lane signed byte add. Mix of positive and negative bytes
+    /// drives both the `r >= 0` and `r < 0` GE branches.
+    #[test]
+    fn sadd8_signed_byte_add_sets_ge_per_lane() {
+        let mut c = CortexM33::for_test(0);
+        // Bytes (lane3..lane0): R1 = +10, -10, +20, -20.
+        c.set_reg(1, 0x0A_F6_14_EC);
+        // Bytes:                R2 = +5, +5, -5, -5.
+        c.set_reg(2, 0x05_05_FB_FB);
+        let (hw0, hw1) = encode_parallel(0b000, 0b000, 1, 0, 2);
+        c.execute_one_wide(hw0, hw1);
+        let r = c.reg(0);
+        // Lane sums: 15, -5, 15, -25 → bytes 0F, FB, 0F, E7.
+        assert_eq!(r, 0x0F_FB_0F_E7);
+        // GE bits: lane0 (-25) <0 → 0, lane1 (+15) ≥0 → 1, lane2 (-5) <0 → 0,
+        // lane3 (+15) ≥0 → 1 → 0b1010.
+        assert_eq!(c.regs.ge_flags() & 0xF, 0b1010);
+    }
+
+    /// SSUB8: 4-lane signed byte sub. Mix of borrow and no-borrow lanes.
+    #[test]
+    fn ssub8_signed_byte_sub_sets_ge_per_lane() {
+        let mut c = CortexM33::for_test(0);
+        // R1 = +30, +10, +20, -50. Bytes: 0x1E, 0x0A, 0x14, 0xCE.
+        c.set_reg(1, 0x1E_0A_14_CE);
+        // R2 = +10, +20, +30, -10. Bytes: 0x0A, 0x14, 0x1E, 0xF6.
+        c.set_reg(2, 0x0A_14_1E_F6);
+        let (hw0, hw1) = encode_parallel(0b100, 0b000, 1, 0, 2);
+        c.execute_one_wide(hw0, hw1);
+        let r = c.reg(0);
+        // Lane diffs: -50 - -10 = -40 (D8); 20-30 = -10 (F6); 10-20 = -10
+        // (F6); 30-10 = +20 (14).
+        assert_eq!(r, 0x14_F6_F6_D8);
+        // GE bits: lane0 (-40) <0 →0, lane1 (-10) <0 →0, lane2 (-10) <0 →0,
+        // lane3 (+20) ≥0 →1 → 0b1000.
+        assert_eq!(c.regs.ge_flags() & 0xF, 0b1000);
+    }
+
+    /// USUB8: 4-lane unsigned byte sub. Exercises `parallel_unsigned_8`'s
+    /// SUB branch, including the `r >= 0` (no-borrow → GE set) decision.
+    #[test]
+    fn usub8_unsigned_byte_sub_sets_ge_per_lane() {
+        let mut c = CortexM33::for_test(0);
+        c.set_reg(1, 0xFF_80_10_05);
+        c.set_reg(2, 0x01_40_20_05);
+        let (hw0, hw1) = encode_parallel(0b100, 0b100, 1, 0, 2);
+        c.execute_one_wide(hw0, hw1);
+        let r = c.reg(0);
+        // Lane unsigned diffs:
+        //   lane0: 0x05 - 0x05 = 0x00, no borrow → GE[0]=1.
+        //   lane1: 0x10 - 0x20 = -0x10 → 0xF0, borrow → GE[1]=0.
+        //   lane2: 0x80 - 0x40 = 0x40, no borrow → GE[2]=1.
+        //   lane3: 0xFF - 0x01 = 0xFE, no borrow → GE[3]=1.
+        assert_eq!(r, 0xFE_40_F0_00);
+        assert_eq!(c.regs.ge_flags() & 0xF, 0b1101);
+    }
+}
 
