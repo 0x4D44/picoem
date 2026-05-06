@@ -1198,10 +1198,28 @@ impl Bus {
         // step quantum (HLD 2026.05.06 §3 — "DMA pacing within step
         // quantum"); pre-fix DMA was ticked exactly once regardless of
         // sys_clks, capping throughput at 1/quantum.
+        //
+        // Stage 4 fast path (HLD 2026.05.06 §4.5): hoist the
+        // busy/timer-programmed check out of the per-cycle loop.
+        // `tick_dma` is a hot wrapper (`mem::take` + restore of `Dma`,
+        // timer accumulator advance, `route_irqs`); paying that
+        // sys_clks times is the dominant cost when no channel is
+        // armed and no timer is paced. `Dma::needs_tick()` returns
+        // `true` if any channel is BUSY or any timer's `X != 0 && Y
+        // != 0` — the latter must keep ticking so a future channel
+        // arming with that timer pace observes a running accumulator.
         if !self.is_held_in_reset_bit(RESET_DMA) {
-            for _ in 0..sys_clks {
-                self.tick_dma();
+            if self.dma.needs_tick() {
+                for _ in 0..sys_clks {
+                    self.tick_dma();
+                }
             }
+            // HLD §4.5 follow-up: IRQ routing must run every quantum
+            // regardless of whether channels/timers needed advancement.
+            // INTFn (force-IRQ) and "INTR latched, then INTE enabled
+            // later" require route_irqs to fire even when the work
+            // loop is skipped. Cheap: 4 bitwise ANDs + atomic stores.
+            self.dma.route_irqs(&self.atomics);
         }
 
         // WATCHDOG countdown — one cycle per `tick_peripherals` invocation
@@ -3312,6 +3330,12 @@ impl Bus {
     pub fn tick_dma(&mut self) {
         let mut dma = std::mem::take(&mut self.dma);
         dma.tick(self);
+        // Stage 4: production path's source of truth for IRQ routing
+        // is the unconditional `dma.route_irqs` call at the tail of
+        // `tick_peripherals` (HLD 2026.05.06 §4.5). Keeping the call
+        // here is idempotent (re-asserting an already-asserted IRQ
+        // is a no-op) and preserves the documented `tick_dma()`
+        // contract for unit tests that call it directly.
         dma.route_irqs(&self.atomics);
         self.dma = dma;
     }

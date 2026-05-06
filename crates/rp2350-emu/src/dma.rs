@@ -342,6 +342,36 @@ impl Dma {
         !self.channels.iter().any(|c| c.busy) && self.intr == 0
     }
 
+    /// True iff `tick()` could observably change state on this cycle.
+    ///
+    /// Used by `Bus::tick_peripherals` to skip the per-sysclk
+    /// `tick_dma` loop entirely when nothing is going to advance —
+    /// closes the remaining 5x perf gap from Stage 4 of the DMA
+    /// pacing HLD (2026.05.06 §4.5).
+    ///
+    /// Returns `true` if either:
+    /// * any channel currently has `BUSY` set (an in-flight transfer
+    ///   that needs to advance), OR
+    /// * any of the four pacing timers is programmed (`X != 0` AND
+    ///   `Y != 0` in `Xreg = X[31:16]:Y[15:0]`) so its accumulator
+    ///   must keep ticking even with no channel armed against it.
+    ///
+    /// Note: deliberately weaker than `!is_idle()` — `is_idle` also
+    /// gates on `intr == 0`, but a latched IRQ does not need
+    /// per-cycle advancement to keep state consistent. The bus-level
+    /// fast path can safely skip ticking in that case.
+    #[inline]
+    pub fn needs_tick(&self) -> bool {
+        if self.channels.iter().any(|c| c.busy) {
+            return true;
+        }
+        self.timer.iter().any(|&reg| {
+            let x = (reg >> 16) & 0xFFFF;
+            let y = reg & 0xFFFF;
+            x != 0 && y != 0
+        })
+    }
+
     /// Borrow a channel read-only (exposed for tests / observability).
     pub fn channel(&self, i: usize) -> &DmaChannel {
         &self.channels[i]
@@ -633,6 +663,14 @@ impl Dma {
             } else {
                 self.timer_dreq_asserted[i] = false;
             }
+        }
+
+        // HLD §4.5: skip arbitration when no channel is armed. Saves
+        // `collect_dreqs()` + 16-channel scan on quanta with no DMA work.
+        // Timers above must still tick because a future trigger arms a
+        // channel observing the running accumulator.
+        if self.channels.iter().all(|ch| !ch.busy) {
+            return;
         }
 
         let dreqs = bus.collect_dreqs();
@@ -2111,5 +2149,42 @@ mod tests {
                 "no transfer while DMA held in reset (word {i})"
             );
         }
+    }
+
+    /// Test 7: INTF0-driven force-IRQ propagates through tick_peripherals
+    /// even when DMA is otherwise idle (no busy channel, no timer).
+    ///
+    /// Pre-`route_irqs`-hoist: the bus-level fast path skipped tick_dma,
+    /// route_irqs never fired, IRQ_DMA_IRQ_0 stayed deasserted indefinitely.
+    /// Post-hoist: route_irqs runs unconditionally per quantum.
+    #[test]
+    fn tick_peripherals_routes_force_irq_when_dma_idle() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        // No channel armed, no timer programmed, but force IRQ_0 via INTF0|INTE0.
+        bus.write32(DMA_BASE + REG_INTF0, 0x0001, 0);
+        bus.write32(DMA_BASE + REG_INTE0, 0x0001, 0);
+
+        // Sanity: DMA reports idle (no busy channel, no programmed timer)
+        // — this is the path that previously skipped route_irqs entirely.
+        assert!(
+            !bus.dma.needs_tick(),
+            "precondition: DMA must be idle so the fast path is exercised"
+        );
+
+        bus.tick_peripherals(64);
+
+        // The shared IRQ line should now be asserted on both cores.
+        assert_ne!(
+            bus.atomics.irq_pending_load(0) & (1u64 << IRQ_DMA_IRQ_0),
+            0,
+            "IRQ_DMA_IRQ_0 must be asserted via INTF0 force-IRQ even when DMA is otherwise idle (core 0)"
+        );
+        assert_ne!(
+            bus.atomics.irq_pending_load(1) & (1u64 << IRQ_DMA_IRQ_0),
+            0,
+            "IRQ_DMA_IRQ_0 must be asserted via INTF0 force-IRQ even when DMA is otherwise idle (core 1)"
+        );
     }
 }
