@@ -14,6 +14,23 @@ public release simply ships those current versions.
 
 ## [Unreleased]
 
+## [2026-05-06]
+
+Patch release for `rp2350-emu`. DMA pacing within the step quantum: the DMA
+controller now ticks per master-clock cycle inside `step()` (instead of
+once per quantum at the boundary), and multiple shared-DREQ channels can
+fire on a single tick. Test-only push-event hook added on `Dma`/`Bus`
+behind `cfg(feature = "testing")`. Bus-level fast path + `route_irqs`
+hoist preserve no-DMA-armed performance.
+
+Reference HLD: `wrk_docs/2026.05.06 - HLD - DMA Pacing Within Step Quantum.md`.
+
+### Crates published to crates.io
+
+| Crate | Version | Change |
+|---|---|---|
+| `rp2350-emu` | `0.2.2` | Silicon-correct DMA pacing within step quantum; multi-channel-per-tick arbitration for shared DREQs; `cfg(feature = "testing")` push-event hook on `Dma`/`Bus`; bus fast path + `route_irqs` hoist (no perf regression when no DMA channels are armed). |
+
 ## [2026-05-04]
 
 Second publication round. Picks up the wide-GPIO bus work (RP2354 high-half
