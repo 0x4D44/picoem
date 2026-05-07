@@ -635,6 +635,7 @@ fn main() -> ExitCode {
     // every CH1 push edge captured during the observation window must:
     //   1. Have `last_src_addr` inside `[SHADOW_BASE, SHADOW_BASE + shadow_size)`
     //   2. Carry the byte `(last_src_addr & 0xFF) ^ 0x55`
+    let mut smoke_passed = false;
     if !obs_log.is_empty() {
         println!();
         println!(
@@ -677,15 +678,26 @@ fn main() -> ExitCode {
             ch1_pushes,
             SHADOW_BASE,
             fixture_spec.shadow_size as u32,
+            &obs_log,
+            ADDR_SWEEP,
+            ADDR_DWELL_CYCLES,
         );
         match verdict {
-            SmokeVerdict::Pass { edges, distinct_src_addrs } => {
+            SmokeVerdict::Pass {
+                edges,
+                distinct_src_addrs,
+                pin_matches,
+            } => {
                 println!(
                     "SMOKE TEST PASS — {} CH1 push edges across {} distinct \
                      src addresses, all from SHADOW range and all bytes \
-                     matched (addr & 0xFF) ^ 0x55 (ch1_pushes={})",
-                    edges, distinct_src_addrs, ch1_pushes
+                     matched (addr & 0xFF) ^ 0x55 (ch1_pushes={}); \
+                     {}/{} sweep addresses produced the correct data byte \
+                     on D0..D7 with PIO2 driving",
+                    edges, distinct_src_addrs, ch1_pushes,
+                    pin_matches, ADDR_SWEEP.len()
                 );
+                smoke_passed = true;
             }
             SmokeVerdict::Fail(reason) => {
                 println!("SMOKE TEST FAIL — {}", reason);
@@ -697,7 +709,8 @@ fn main() -> ExitCode {
         Some(c) => {
             println!();
             println!(
-                "SUCCESS — PIO1 (addr) + PIO2 (data) both have SMs enabled at cycle {}",
+                "{} — PIO1 (addr) + PIO2 (data) both have SMs enabled at cycle {}",
+                if smoke_passed { "SUCCESS" } else { "PARTIAL" },
                 c
             );
             println!(
@@ -705,7 +718,15 @@ fn main() -> ExitCode {
                 emu.bus.pio[1].read32(PIO_CTRL),
                 emu.bus.pio[2].read32(PIO_CTRL),
             );
-            ExitCode::SUCCESS
+            // Smoke verdict feeds the exit code now (was previously
+            // SUCCESS-on-sync, FAIL-otherwise — which let byte-wrong
+            // serves slip through). Sync without a passing smoke
+            // verdict is reported as PARTIAL above and exits FAILURE.
+            if smoke_passed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         None => {
             println!();
@@ -717,15 +738,26 @@ fn main() -> ExitCode {
 
 /// Result of the byte-correctness smoke test on CH1 push edges.
 enum SmokeVerdict {
-    /// At least one CH1 push edge was observed, every edge's
-    /// `last_src_addr` was inside the SHADOW range, every pushed byte
-    /// matched the deterministic pattern `(addr & 0xFF) ^ 0x55`, and
-    /// the harness saw `last_src_addr` take more than one distinct
-    /// value (proving CH1.READ_ADDR is updating in response to the
-    /// address-pin sweep, not stuck on a firmware-initialised value).
+    /// All verdict criteria passed:
+    ///   1. At least one CH1 push edge was observed, every edge's
+    ///      `last_src_addr` was inside the SHADOW range, every pushed
+    ///      byte matched the deterministic pattern `(addr & 0xFF) ^ 0x55`,
+    ///      and the harness saw `last_src_addr` take more than one
+    ///      distinct value.
+    ///   2. For every sweep address word that produced at least one CH1
+    ///      push during its dwell window, the data pins (D0..D7) showed
+    ///      a byte from that dwell's push set on at least one cycle
+    ///      where PIO2 was actively driving the pads. Dwells with no
+    ///      pushes are skipped (inconclusive, not failure). At least
+    ///      **two** dwells must have produced a positive match —
+    ///      mirrors criterion 4's distinct-src-addrs cardinality
+    ///      requirement. A single match is too easy to satisfy with a
+    ///      stuck-byte regression that happens to align with one
+    ///      dwell.
     Pass {
         edges: usize,
         distinct_src_addrs: usize,
+        pin_matches: usize,
     },
     Fail(String),
 }
@@ -758,11 +790,31 @@ enum SmokeVerdict {
 /// distinct SHADOW offsets. If the pipe is broken, every push lands
 /// on the same firmware-initialised offset and the cardinality
 /// collapses to 1.
+///
+/// Criterion 5 (observation-based pin-data correctness): for each
+/// sweep address word, find the set of `byte_at_src` values pushed
+/// by CH1 during that dwell window, then look for at least one cycle
+/// in the dwell where PIO2 drove a byte from that set onto D0..D7
+/// (`pio2_oe_data_mask == 0xFF`). Dwells with no CH1 pushes are
+/// skipped (inconclusive); at least **two** dwells must produce a
+/// positive match (mirrors criterion 4's distinct-src-addrs
+/// cardinality requirement — a single positive match is satisfiable
+/// by "PIO2 stuck driving the baseline byte" regressions that align
+/// with one dwell by chance, whereas requiring two matches across the
+/// sweep proves the SDRR pipe is genuinely tracking address-pin
+/// changes). We can't compute the firmware's pin-pattern → SHADOW-
+/// offset translation from the outside, but we can observe what
+/// offset CH1 actually read from per dwell and assert PIO2 put that
+/// byte on the pins — which is the same claim the brief's formula
+/// tried to make.
 fn evaluate_smoke_test(
     push_edges: &[(u64, u32, u8, u16)],
     ch1_pushes: u32,
     shadow_base: u32,
     shadow_size: u32,
+    obs_log: &[(u64, u8, u8)],
+    addr_sweep: &[u16],
+    addr_dwell_cycles: u64,
 ) -> SmokeVerdict {
     if ch1_pushes == 0 {
         return SmokeVerdict::Fail(
@@ -844,8 +896,118 @@ fn evaluate_smoke_test(
         ));
     }
 
+    // Criterion 5 (observation-based pin-data correctness): for each
+    // address word in the sweep, the data pins (D0..D7, GPIO 16..23)
+    // must — at least once during the dwell window, while PIO2 is
+    // actively driving the pads (`pio2_oe_data_mask == 0xFF`) — show a
+    // byte that CH1 actually pushed during the same window.
+    //
+    // We can't compute the firmware's internal pin-pattern → SHADOW-
+    // offset lift function from the outside (when the harness drives
+    // pin pattern 0x1855, CH1 reads from 0x200090AA, not 0x20001855 —
+    // OneROM does its own bit-shuffle/bank-offset translation), so we
+    // can't compare against `((shadow_base + addr_word) & 0xFF) ^ 0x55`.
+    // What we CAN observe is the byte CH1 read from `last_src_addr` at
+    // each push (`byte_at_src`) — and that's exactly the byte PIO2
+    // should have shifted out for this address word. The contract
+    // shifts from "pin byte equals SHADOW[lift(pattern)]" (formula we
+    // can't compute) to the equivalent observable: "pin byte equals one
+    // of the bytes CH1 pushed during this dwell".
+    //
+    // Dwells with no CH1 pushes are skipped (inconclusive — CH1 may not
+    // have caught up yet, particularly at the tail of an early-exit
+    // run), but at least one dwell must produce a positive match —
+    // passing without ANY observation that exercised the serve pipeline
+    // is meaningless.
+    let mut pin_matches = 0usize;
+    for (sweep_idx, &addr_word) in addr_sweep.iter().enumerate() {
+        let dwell_start = (sweep_idx as u64) * addr_dwell_cycles;
+        let dwell_end = dwell_start + addr_dwell_cycles;
+
+        // Collect the set of bytes CH1 pushed during this dwell. The
+        // edges are stored with the address-pin word that was being
+        // driven at the time; we filter by relative cycle within the
+        // dwell window rather than by `addr_word` so we're tolerant of
+        // edges captured one cycle late (the harness samples
+        // `last_src_addr` after the GPIO-in store).
+        let mut push_bytes: Vec<u8> = push_edges
+            .iter()
+            .filter(|(cyc, _, _, _)| *cyc >= dwell_start && *cyc < dwell_end)
+            .map(|(_, _, byte, _)| *byte)
+            .collect();
+        push_bytes.sort_unstable();
+        push_bytes.dedup();
+
+        if push_bytes.is_empty() {
+            // Inconclusive but not failure — no CH1 push activity in
+            // this dwell to validate against. Move on.
+            continue;
+        }
+
+        let mut hit = false;
+        let mut cycles_with_oe = 0usize;
+        let mut last_byte = 0u8;
+        for (cyc, byte, oe) in obs_log {
+            if *cyc >= dwell_start && *cyc < dwell_end && *oe == 0xFF {
+                cycles_with_oe += 1;
+                last_byte = *byte;
+                if push_bytes.contains(byte) {
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        if !hit {
+            let push_bytes_disp: Vec<String> =
+                push_bytes.iter().map(|b| format!("0x{:02X}", b)).collect();
+            return SmokeVerdict::Fail(format!(
+                "address-pin sweep word #{}/0x{:04X} (dwell rel cycles \
+                 {}..{}): CH1 pushed bytes {{{}}} during this dwell, \
+                 but no cycle in the dwell window showed any of those \
+                 bytes on D0..D7 with PIO2 driving (pad_oe == 0xFF). \
+                 Cycles with PIO2 driving in this window: {}; last byte \
+                 seen on D0..D7: 0x{:02X}. Clue: CH1 produced \
+                 byte-correct pushes (criteria 1–4 passed) but PIO2 \
+                 either did not assert OE in this window, or shifted out \
+                 a byte that didn't come from CH1's recent pushes — \
+                 check PIO2's program, FSTAT/FLEVEL, and the SM clock \
+                 divisor.",
+                sweep_idx,
+                addr_word,
+                dwell_start,
+                dwell_end,
+                push_bytes_disp.join(", "),
+                cycles_with_oe,
+                last_byte,
+            ));
+        }
+        pin_matches += 1;
+    }
+
+    if pin_matches < 2 {
+        return SmokeVerdict::Fail(format!(
+            "address-pin sweep produced fewer than 2 positive pin-data \
+             matches ({}/{} dwells matched). Mirrors criterion 4's \
+             distinct-src-addrs cardinality requirement: passing the \
+             smoke verdict on a single dwell match would let \"PIO2 \
+             stuck driving the baseline byte\" failure modes slip \
+             through — a stuck-byte regression looks identical to a \
+             working harness for whichever single dwell happens to \
+             match by chance. Requiring >= 2 matches across the sweep \
+             ensures the SDRR pipe is genuinely tracking address-pin \
+             changes. Sweep config: {} sweep words × {} cycles, total \
+             pushes captured: {}.",
+            pin_matches,
+            addr_sweep.len(),
+            addr_sweep.len(),
+            addr_dwell_cycles,
+            push_edges.len(),
+        ));
+    }
+
     SmokeVerdict::Pass {
         edges: push_edges.len(),
         distinct_src_addrs: distinct.len(),
+        pin_matches,
     }
 }

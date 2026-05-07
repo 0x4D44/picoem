@@ -35374,3 +35374,52 @@ mod stage11_parallel_extend {
     }
 }
 
+// ============================================================================
+// RESETS narrow writes (HLD: 2026.05.07 - HLD - Bus Narrow-Write Drop Audit V1)
+// ============================================================================
+
+/// Narrow writes to RESETS (`0x4002_0000`) must AHB-widen to a 32-bit
+/// transaction at the peripheral, mirroring the 0.2.4 PIO TXF fix. On
+/// silicon, `STRB` / `STRH` to a SET/CLR alias arrives at the peripheral
+/// as a 32-bit transaction with the byte/halfword shifted into its lane;
+/// the existing `peripherals.rs::resets_write` already implements the
+/// 4-alias semantics.
+///
+/// Regression: pre-fix the RESETS arms in `Bus::write8` / `Bus::write16`
+/// were `=> {}` no-ops, so a `STRB` to a SET/CLR alias of `RESETS.RESET`
+/// silently disappeared.
+#[test]
+fn resets_narrow_writes_widen_to_32_bit() {
+    let mut bus = Bus::new();
+
+    // Re-arm RESETS.RESET to the all-ones state so the test reasons in
+    // simple, full-width terms regardless of `RESETS_POST_BOOTROM`.
+    // `peripherals.rs::resets_write` does NOT clamp `resets_state` to
+    // the 29-bit field width on plain writes, so this reads back as
+    // 0xFFFF_FFFF.
+    bus.write32(0x4002_0000, 0xFFFF_FFFF, 0);
+    let initial = bus.read32(0x4002_0000, 0);
+    assert_eq!(initial, 0xFFFF_FFFF);
+
+    // Byte write (alias=0) to byte-lane 0 of RESETS.RESET clears bits 0..7.
+    bus.write8(0x4002_0000, 0x00, 0);
+    assert_eq!(bus.read32(0x4002_0000, 0), initial & 0xFFFF_FF00);
+
+    // Halfword write (alias=0) to halfword-lane 1 of RESETS.RESET clears
+    // bits 16..31.
+    bus.write16(0x4002_0002, 0x0000, 0);
+    assert_eq!(bus.read32(0x4002_0000, 0), initial & 0x0000_FF00);
+
+    // CLR-alias byte write at +0x3000 to byte-lane 0 clears specific bits.
+    // Re-arm first so the math is clean.
+    bus.write32(0x4002_0000, 0xFFFF_FFFF, 0);
+    bus.write8(0x4002_3000, 0x0F, 0);
+    assert_eq!(bus.read32(0x4002_0000, 0), 0xFFFF_FFF0);
+
+    // SET-alias halfword write at +0x2002 to halfword-lane 1 sets bits
+    // 16..31. Start from zero so the SET semantic is observable.
+    bus.write32(0x4002_0000, 0x0000_0000, 0);
+    bus.write16(0x4002_2002, 0xABCD, 0);
+    assert_eq!(bus.read32(0x4002_0000, 0), 0xABCD_0000);
+}
+

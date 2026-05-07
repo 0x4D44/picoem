@@ -746,3 +746,247 @@ fn test_pio_resets_gating() {
          (ran 5 cycles with a 2-instruction NOP loop)"
     );
 }
+
+/// Narrow (byte / halfword) writes to PIO TX FIFO registers must widen
+/// to 32 bit and land as a single FIFO entry. On real RP2350 silicon
+/// the AHB widens any narrow write to a 32-bit transaction before it
+/// reaches the PIO peripheral; a byte write at byte-lane N produces a
+/// `(val as u32) << (N*8)` FIFO entry. DMA byte-mode transfers from
+/// SRAM to a PIO TX FIFO (the OneROM CH1 pattern) rely on this.
+///
+/// Regression: pre-0.2.4 the `Bus::write8` / `Bus::write16` PIO arms
+/// were silent no-ops, so DMA byte transfers vanished even though
+/// `TRANS_COUNT` decremented and `INTR` latched.
+#[test]
+fn pio_narrow_writes_widen_to_32_bit() {
+    let mut bus = Bus::new();
+
+    // PIO0 TXF1 (offset 0x014) — byte / halfword / word at byte lane 0.
+    bus.write8(0x5020_0014, 0xCD, 0);
+    assert_eq!(bus.pio[0].pop_tx(1), Some(0x0000_00CD));
+    bus.write16(0x5020_0014, 0xABCD, 0);
+    assert_eq!(bus.pio[0].pop_tx(1), Some(0x0000_ABCD));
+    bus.write32(0x5020_0014, 0xCAFE_F00D, 0);
+    assert_eq!(bus.pio[0].pop_tx(1), Some(0xCAFE_F00D));
+
+    // PIO1 TXF2 (offset 0x018) — confirm the dispatch arm hits the
+    // right block and SM, not just PIO0.
+    bus.write8(0x5030_0018, 0x42, 0);
+    assert_eq!(bus.pio[1].pop_tx(2), Some(0x0000_0042));
+    bus.write16(0x5030_0018, 0xBEEF, 0);
+    assert_eq!(bus.pio[1].pop_tx(2), Some(0x0000_BEEF));
+
+    // PIO2 TXF1 (offset 0x014) — the exact register the OneROM CH1
+    // DMA byte stream targets in the SDRR firmware.
+    bus.write8(0x5040_0014, 0xCD, 0);
+    assert_eq!(bus.pio[2].pop_tx(1), Some(0x0000_00CD));
+    bus.write16(0x5040_0014, 0xABCD, 0);
+    assert_eq!(bus.pio[2].pop_tx(1), Some(0x0000_ABCD));
+    bus.write32(0x5040_0014, 0x1234_5678, 0);
+    assert_eq!(bus.pio[2].pop_tx(1), Some(0x1234_5678));
+
+    // Byte lane within the TXF word: a byte write to TXF0+1 goes to
+    // byte lane 1, producing `0x0000_CD00`. (DMA byte-mode in practice
+    // hits lane 0 because the FIFO is a permanent address; the
+    // higher-lane behaviour is what the AHB widening spec mandates and
+    // what differentiates "drop" from "wrong byte lane".)
+    bus.write8(0x5040_0011, 0xCD, 0);
+    assert_eq!(bus.pio[2].pop_tx(0), Some(0x0000_CD00));
+
+    // Lane 2 byte write — `STRB Rn, [Rm, #2]` against TXF0 base+2
+    // should land at bits [23:16]. Confirms the `(val as u32) <<
+    // (byte_idx * 8)` shift covers the full byte-lane range, not just
+    // lanes 0/1. (TXF0 = offset 0x010; the 0x012 address hits TXF0
+    // word-aligned at 0x010, byte_idx = 2.)
+    bus.write8(0x5040_0012, 0xCD, 0);
+    assert_eq!(bus.pio[2].pop_tx(0), Some(0x00CD_0000));
+
+    // Lane 3 byte write — top byte lane (TXF0, byte_idx = 3).
+    bus.write8(0x5040_0013, 0xCD, 0);
+    assert_eq!(bus.pio[2].pop_tx(0), Some(0xCD00_0000));
+
+    // Halfword lane 1 — `STRH Rn, [Rm, #2]`. The half_idx*16 shift maps
+    // base+2 to bits [31:16]. (TXF0 word-aligned, half_idx = 1.)
+    bus.write16(0x5040_0012, 0xABCD, 0);
+    assert_eq!(bus.pio[2].pop_tx(0), Some(0xABCD_0000));
+}
+
+/// Narrow writes to PIO RXF (offsets 0x020..=0x02C) MUST NOT pop the RX
+/// FIFO. The standard subword-alias RMW used for the rest of the PIO
+/// register space would issue `read32(reg_offset)` to fetch the lanes
+/// outside the byte being written, but `read32` for RXF is destructive —
+/// it pops the head of the SM's RX FIFO (`picoem_common::pio::mod.rs`
+/// 0x020..=0x02C dispatch). On real silicon RXF is read-only on write,
+/// so the AHB-widened narrow write is silently dropped at the peripheral.
+///
+/// Regression: pre-fix the new 0.2.4 PIO arm RMW'd RXF too, so a `STRB`
+/// to the RXF aperture would spurious-drain RX from underneath the
+/// firmware that was about to read it.
+#[test]
+fn pio_narrow_writes_to_rxf_dont_pop_fifo() {
+    let mut bus = Bus::new();
+
+    // Stage a known word at the head of PIO0 SM0 RX FIFO via the
+    // test-only push_rx hook (`cfg(any(test, feature = "test-hooks"))`).
+    bus.pio[0].push_rx(0, 0xCAFE_F00D);
+
+    // A narrow write to PIO0 RXF0 (offset 0x020) — byte lane 0, plain
+    // alias — MUST NOT pop the FIFO.
+    bus.write8(0x5020_0020, 0xFF, 0);
+    // Halfword lane 0, plain alias — also MUST NOT pop.
+    bus.write16(0x5020_0020, 0xFFFF, 0);
+    // Byte lane 1 (a different byte lane to prove the guard isn't only
+    // checking lane 0).
+    bus.write8(0x5020_0021, 0xAA, 0);
+    // SET-alias byte at +0x2000 — proves the guard is unconditional on
+    // alias too, not just plain (alias=0) writes.
+    bus.write8(0x5020_2020, 0x55, 0);
+
+    // The original word should still be at the head of RXF0; read32 pops it.
+    assert_eq!(bus.read32(0x5020_0020, 0), 0xCAFE_F00D);
+    // FIFO is now empty — read32 returns 0.
+    assert_eq!(bus.read32(0x5020_0020, 0), 0);
+
+    // Cross-block coverage: stage a word in PIO2 SM3 RXF (offset 0x02C)
+    // and confirm the carve-out fires for the whole RXF range, not just
+    // RXF0 of PIO0.
+    bus.pio[2].push_rx(3, 0x1234_5678);
+    bus.write8(0x5040_002C, 0xFF, 0);
+    bus.write16(0x5040_002C, 0xFFFF, 0);
+    bus.write8(0x5040_202C, 0x55, 0); // SET-alias byte
+    assert_eq!(bus.read32(0x5040_002C, 0), 0x1234_5678);
+    assert_eq!(bus.read32(0x5040_002C, 0), 0);
+}
+
+/// Narrow writes to FDEBUG (offset `0x008`) MUST NOT corrupt unchanged
+/// byte lanes. FDEBUG is W1C with a *live* read — unlike UART/SPI/I2C
+/// W1C registers (which read as 0 and so degenerate cleanly under
+/// subword RMW), FDEBUG reads its current state. The standard
+/// subword-alias RMW would read the live state, splice the changed
+/// byte, and write it back — but the W1C semantics turn that into
+/// "every set bit in the unchanged lanes is cleared". With the
+/// TXF-only-widen policy, narrow writes outside `0x010..=0x01C` are
+/// dropped at the bus arm, leaving FDEBUG untouched (matching silicon
+/// AHB5 byte-strobe behaviour for a register that doesn't decode
+/// narrow strobes).
+#[test]
+fn pio_narrow_writes_to_fdebug_dont_corrupt() {
+    let mut bus = Bus::new();
+
+    // Seed FDEBUG with a known non-zero value via the SET-alias word
+    // write (alias 2, offset +0x2000). FDEBUG starts at 0; we can't
+    // write 1's via the plain alias because that's W1C clear.
+    bus.write32(0x5020_2008, 0x1234_5678, 0);
+    let pre = bus.read32(0x5020_0008, 0);
+    assert_eq!(
+        pre, 0x1234_5678,
+        "seed via SET alias must land at FDEBUG"
+    );
+
+    // Narrow byte-0 write to FDEBUG. With the broken RMW path this
+    // would (a) read 0x1234_5678, (b) splice byte 0 to 0xFF, (c) write
+    // 0x1234_56FF back, and the W1C arm would clear every 1-bit in
+    // 0x1234_56FF — destroying the FDEBUG state. With TXF-only-widen
+    // the write is dropped; FDEBUG stays put.
+    bus.write8(0x5020_0008, 0xFF, 0);
+    assert_eq!(
+        bus.read32(0x5020_0008, 0),
+        0x1234_5678,
+        "narrow byte-0 write must not corrupt FDEBUG"
+    );
+
+    // Narrow halfword-1 write — same reasoning, different lane.
+    bus.write16(0x5020_000A, 0xFFFF, 0);
+    assert_eq!(
+        bus.read32(0x5020_0008, 0),
+        0x1234_5678,
+        "narrow halfword-1 write must not corrupt FDEBUG"
+    );
+}
+
+/// Narrow byte-1 write to CTRL (`0x000`) MUST NOT trigger SM_RESTART.
+/// CTRL byte 1 holds the `SM_RESTART[3:0]` self-clearing bits at
+/// `[7:4]`. The standard subword-alias RMW would read CTRL (which
+/// reads back 0 in those bits because they're self-clearing — fine)
+/// and splice the byte. But because the byte we're writing now has
+/// `[7:4]` set, the write triggers a per-SM state reset (PC←0, X/Y/
+/// ISR/OSR cleared). Real silicon decodes the AHB5 byte strobes and
+/// only touches the byte that was strobed — but on RP2350 PIO CTRL
+/// requires a 32-bit access; narrow writes are dropped at the
+/// peripheral. The TXF-only-widen policy implements that drop.
+#[test]
+fn pio_narrow_writes_to_ctrl_dont_trigger_sm_restart() {
+    let mut bus = Bus::new();
+
+    // Force SM0 to a non-zero PC so SM_RESTART would be detectable as
+    // PC←0. Easiest way: force-execute a `JMP 5` via a full-width
+    // SMn_INSTR write. The force_execute path on JMP sets PC directly.
+    bus.write32(0x5020_00D8, 0x0005, 0);
+    assert_eq!(
+        bus.pio[0].sm[0].pc(),
+        5,
+        "precondition: SM0 PC=5 via force-executed JMP"
+    );
+
+    // Issue a narrow byte-1 write to CTRL with byte = 0xF0 (SM_RESTART
+    // bits [7:4] all set). The TXF-only-widen drop means this byte
+    // never reaches the PIO peripheral — SM_RESTART must NOT fire and
+    // PC must stay at 5.
+    bus.write8(0x5020_0001, 0xF0, 0);
+    assert_eq!(
+        bus.pio[0].sm[0].pc(),
+        5,
+        "narrow byte-1 write must NOT trigger SM_RESTART (PC stays at 5)"
+    );
+
+    // Comparison case: a full-width 32-bit write of `0x0000_00F0`
+    // DOES trigger SM_RESTART (PC←0). This proves byte-1 narrow drop
+    // is genuinely a drop rather than a coincidence (e.g. that the
+    // SM_RESTART path itself isn't broken).
+    bus.write32(0x5020_0000, 0x0000_00F0, 0);
+    assert_eq!(
+        bus.pio[0].sm[0].pc(),
+        0,
+        "full-width SM_RESTART write must reset PC to 0 (control case)"
+    );
+}
+
+/// Narrow byte-0 write to SMn_INSTR (`0x0D8`) MUST NOT force-execute.
+/// SMn_INSTR is write-execute on every 32-bit write; the standard
+/// subword-alias RMW path computes `(last_insn[31:8] | val)` and
+/// passes the result to `force_execute`. Real silicon for a
+/// narrow-write to SMn_INSTR either drops the write or executes
+/// `(0x0000 | val)` — in either case it does NOT mix in the previous
+/// `last_insn`. The TXF-only-widen drop matches the safer
+/// silicon-friendly behaviour: no spurious force-execute at all.
+#[test]
+fn pio_narrow_writes_to_sm_instr_dont_force_execute() {
+    let mut bus = Bus::new();
+
+    // Seed `last_insn` with a recognisable opcode by full-width
+    // writing `JMP 5` (0x0005). force_execute updates last_insn and
+    // sets PC.
+    bus.write32(0x5020_00D8, 0x0005, 0);
+    assert_eq!(bus.pio[0].sm[0].pc(), 5, "precondition: PC=5 after JMP 5");
+    assert_eq!(
+        bus.read32(0x5020_00D8, 0),
+        0x0005,
+        "precondition: last_insn = 0x0005"
+    );
+
+    // Issue narrow byte-0 write of `0x07` to SMn_INSTR. Under the
+    // broken RMW path this would force-execute `(0x0005 & !0xFF) |
+    // 0x07 = 0x0007` (JMP 7), advancing PC to 7. Under TXF-only-widen
+    // the write is dropped — PC stays at 5.
+    bus.write8(0x5020_00D8, 0x07, 0);
+    assert_eq!(
+        bus.pio[0].sm[0].pc(),
+        5,
+        "narrow byte-0 write to SMn_INSTR must NOT force-execute"
+    );
+    assert_eq!(
+        bus.read32(0x5020_00D8, 0),
+        0x0005,
+        "last_insn must be unchanged (no force-execute happened)"
+    );
+}
