@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "picoem-harness"
-version = "0.41.5"
+version = "0.41.6"
 dependencies = [
  "chrono",
  "ctrlc",
@@ -2230,7 +2230,7 @@ dependencies = [
 
 [[package]]
 name = "rp2350-emu"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "picoem-common",
  "sha2",

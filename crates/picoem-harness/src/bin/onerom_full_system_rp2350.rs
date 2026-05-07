@@ -81,14 +81,60 @@ const GPIO_CS3: u8 = 15;
 const ADDR_PINS: [u8; 13] = [7, 6, 5, 4, 3, 2, 1, 0, 10, 11, 14, 15, 12];
 
 /// How many post-sync cycles we drive stimulus for before giving up
-/// (or hitting a second WFI).
-const POST_SYNC_STIMULUS_CYCLES: u64 = 40;
+/// (or hitting a second WFI). Bumped from 40 to 200 to give the
+/// address-pin sweep below room to drive several distinct addresses
+/// with enough dwell time per address for the PIO+DMA chain to
+/// propagate the change (PIO1 SM samples → RXF → CH0 → CH1.READ_ADDR
+/// update → CH1 read → push edge).
+const POST_SYNC_STIMULUS_CYCLES: u64 = 200;
+
+/// Number of master-clock cycles to hold each address-pin pattern
+/// before advancing to the next. Picked so the PIO+DMA chain has a
+/// steady-state window per pattern even at high latency.
+const ADDR_DWELL_CYCLES: u64 = 40;
 
 fn repo_root_relative(rel: &str) -> PathBuf {
     // Harness is invoked from the workspace root via `cargo run`; that's
     // the cwd, and all paths in this file are workspace-relative.
     Path::new(rel).to_path_buf()
 }
+
+/// Map a 13-bit address word `addr` (A0..A12) to the GPIO-level mask
+/// the harness should drive. `ADDR_PINS[i]` is the GPIO that carries
+/// `A[i]`; if bit `i` of `addr` is set, the corresponding GPIO bit is
+/// set in the returned mask.
+fn addr_word_to_gpio_levels(addr: u16) -> u32 {
+    let mut levels = 0u32;
+    for (bit_idx, &pin) in ADDR_PINS.iter().enumerate() {
+        if (addr >> bit_idx) & 1 == 1 {
+            levels |= 1u32 << pin;
+        }
+    }
+    levels
+}
+
+/// Address sweep pattern. Each entry is a 13-bit address word the
+/// harness drives onto the A0..A12 lanes during the post-sync window.
+///
+/// Constraint (see CAUTION at file head): CS2/CS3 must remain HIGH
+/// while serving (chip selects deasserted) — and CS3=GPIO15 overlaps
+/// A11, CS2=GPIO12 overlaps A12. So every address we drive must have
+/// **A11=A12=1** (i.e. bits 11 and 12 set, value & 0x1800 == 0x1800).
+/// That leaves 11 bits of variation in A0..A10.
+///
+/// We pick 4 distinct addresses, spaced across the legal range, that
+/// produce visibly different `(addr & 0xFF)` byte residues so the
+/// downstream byte-equality check (`(last_src_addr & 0xFF) ^ 0x55`)
+/// is meaningfully different per address. The scan also starts at the
+/// pre-sweep "all-zero address" (0x1800) so the first dwell window
+/// behaves identically to the pre-sweep harness.
+const ADDR_SWEEP: &[u16] = &[
+    0x1800, // baseline: A11=A12=1, A0..A10=0
+    0x1855, // A0,A2,A4,A6 set
+    0x18AA, // A1,A3,A5,A7 set
+    0x1903, // A0,A1,A8 set
+    0x1980, // A7,A8 set
+];
 
 fn main() -> ExitCode {
     picoem_harness::harness_tracing_init();
@@ -245,10 +291,14 @@ fn main() -> ExitCode {
 
     // Per-push-edge log for byte-correctness validation. Each entry records
     // a CH1 push detected during the observation window:
-    //   (relative cycle, last_src_addr, byte read back from that address)
+    //   (relative cycle, last_src_addr, byte read back from that address,
+    //    address-pin word being driven at this cycle).
     // Populated when `bus.dma_channel_transfer_event(1).push_count`
-    // increments cycle-over-cycle.
-    let mut ch1_push_edges: Vec<(u64, u32, u8)> = Vec::new();
+    // increments cycle-over-cycle. The trailing address-pin word is
+    // captured so the verdict can require `last_src_addr` to track the
+    // stimulus — a stuck CH1.READ_ADDR (the bug fixed in rp2350-emu
+    // 0.2.3) cannot satisfy that requirement.
+    let mut ch1_push_edges: Vec<(u64, u32, u8, u16)> = Vec::new();
     // Tracks `push_count` between cycles so we can detect single-cycle
     // edges. Initialised at sync time below.
     let mut ch1_push_count_prev: u32 = 0;
@@ -377,31 +427,58 @@ fn main() -> ExitCode {
             );
 
             // Install external-input stimulus: CS1 low, CS2/CS3 high,
-            // address=0. Using the external-mask override (see the
-            // `gpio_external_*` docs on `Bus`) rather than poking
-            // `gpio_in` directly, which would be clobbered by every
-            // subsequent `update_gpio` call.
+            // address sweep follows below. Using the external-mask
+            // override (see the `gpio_external_*` docs on `Bus`)
+            // rather than poking `gpio_in` directly, which would be
+            // clobbered by every subsequent `update_gpio` call.
             //
             // NB: per the module-level CAUTION above, driving CS3/CS2
             // HIGH simultaneously forces A11/A12 bits to 1. Data pins
             // (D0..D7 on GPIO 16..23) are PIO-driven and must NOT be
             // masked — that's what we're observing. The stimulus mask
             // therefore covers CS1/CS2/CS3 + all address pins only.
+            //
+            // Pre-2026-05-07 the harness drove a fixed all-zero
+            // address for the entire post-sync window, which made
+            // `last_src_addr` trivially constant — even when CH1 was
+            // never updating its `READ_ADDR` register (the
+            // `Bus::tick_dma` `mem::take` borrow trap, fixed in
+            // rp2350-emu 0.2.3). The sweep below drives several
+            // distinct address words so a stuck `READ_ADDR` cannot
+            // hide behind a single uniform stimulus.
             let stim_mask = (1u32 << GPIO_CS1)
                 | (1u32 << GPIO_CS2)
                 | (1u32 << GPIO_CS3)
                 | ADDR_PINS.iter().fold(0u32, |a, &p| a | (1u32 << p));
-            let stim_level = (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
+            // CS2/CS3 high (deasserted) is the constant; address bits
+            // get OR'd in per-step from the sweep schedule. CS1 stays
+            // low (asserted = serving).
+            let cs_level = (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
+            let initial_addr_level = addr_word_to_gpio_levels(ADDR_SWEEP[0]);
             emu.bus.gpio_external_mask = stim_mask;
             emu.bus
                 .gpio_external_in
-                .store(stim_level, Ordering::Relaxed);
+                .store(cs_level | initial_addr_level, Ordering::Relaxed);
         }
 
         // Post-sync: log observations (F.4). The real DMA peripheral
         // drives the chain on its own; no harness-side pump required.
         if let Some(sync_cycle) = sync_detect_cycle {
             let rel_cycle = after_cycles.saturating_sub(sync_cycle);
+
+            // Address-pin sweep: pick which address word should be
+            // driven during this rel_cycle and update the external-in
+            // override. Re-asserting the same level is a cheap atomic
+            // store, so we don't bother gating on "changed" here.
+            let sweep_idx =
+                ((rel_cycle / ADDR_DWELL_CYCLES) as usize).min(ADDR_SWEEP.len() - 1);
+            let active_addr_word = ADDR_SWEEP[sweep_idx];
+            let cs_level = (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
+            let addr_level = addr_word_to_gpio_levels(active_addr_word);
+            emu.bus
+                .gpio_external_in
+                .store(cs_level | addr_level, Ordering::Relaxed);
+
             let data_byte =
                 ((emu.bus.gpio_in.load(Ordering::Relaxed) >> GPIO_DATA_BASE) & 0xFF) as u8;
             let pio2_drives_data = ((emu.bus.pio[2].pad_oe >> GPIO_DATA_BASE) & 0xFF) as u8;
@@ -412,20 +489,23 @@ fn main() -> ExitCode {
             // so any cycle-over-cycle delta is one or more new pushes.
             // Capture `last_src_addr` and re-read the SHADOW byte at that
             // address (SHADOW is immutable post-population, so this is
-            // exactly the byte CH1 fed to PIO2's TX FIFO).
+            // exactly the byte CH1 fed to PIO2's TX FIFO). Also record
+            // the address word the harness was driving at this cycle so
+            // the verdict can correlate `last_src_addr` with the stimulus.
             let ev = emu.bus.dma_channel_transfer_event(1);
             if ev.push_count != ch1_push_count_prev {
                 let src = ev.last_src_addr;
                 let byte = emu.bus.read8(src, 0);
-                ch1_push_edges.push((rel_cycle, src, byte));
+                ch1_push_edges.push((rel_cycle, src, byte, active_addr_word));
                 ch1_push_count_prev = ev.push_count;
             }
 
             if rel_cycle >= POST_SYNC_STIMULUS_CYCLES {
                 println!();
                 println!(
-                    "post-sync stimulus window complete ({} cycles)",
-                    POST_SYNC_STIMULUS_CYCLES
+                    "post-sync stimulus window complete ({} cycles, {} sweep steps)",
+                    POST_SYNC_STIMULUS_CYCLES,
+                    ADDR_SWEEP.len()
                 );
                 break;
             }
@@ -580,14 +660,14 @@ fn main() -> ExitCode {
         println!("  DMA CH1 pushes during observation: {}", ch1_pushes);
         if !ch1_push_edges.is_empty() {
             println!(
-                "POST-SYNC CH1 PUSH EDGES ({} edges, columns: rel_cycle src_addr byte_at_src expected):",
+                "POST-SYNC CH1 PUSH EDGES ({} edges, columns: rel_cycle src_addr byte_at_src expected addr_pin_word):",
                 ch1_push_edges.len()
             );
-            for (cyc, src, byte) in &ch1_push_edges {
+            for (cyc, src, byte, addr_word) in &ch1_push_edges {
                 let expected = ((src & 0xFF) ^ 0x55) as u8;
                 println!(
-                    "  rel {:>3}  src=0x{:08X}  byte=0x{:02X}  expected=0x{:02X}",
-                    cyc, src, byte, expected
+                    "  rel {:>3}  src=0x{:08X}  byte=0x{:02X}  expected=0x{:02X}  addr_pins=0x{:04X}",
+                    cyc, src, byte, expected, addr_word
                 );
             }
         }
@@ -599,11 +679,12 @@ fn main() -> ExitCode {
             fixture_spec.shadow_size as u32,
         );
         match verdict {
-            SmokeVerdict::Pass { edges } => {
+            SmokeVerdict::Pass { edges, distinct_src_addrs } => {
                 println!(
-                    "SMOKE TEST PASS — {} CH1 push edges, all from SHADOW range and \
-                     all bytes matched (addr & 0xFF) ^ 0x55 (ch1_pushes={})",
-                    edges, ch1_pushes
+                    "SMOKE TEST PASS — {} CH1 push edges across {} distinct \
+                     src addresses, all from SHADOW range and all bytes \
+                     matched (addr & 0xFF) ^ 0x55 (ch1_pushes={})",
+                    edges, distinct_src_addrs, ch1_pushes
                 );
             }
             SmokeVerdict::Fail(reason) => {
@@ -637,9 +718,15 @@ fn main() -> ExitCode {
 /// Result of the byte-correctness smoke test on CH1 push edges.
 enum SmokeVerdict {
     /// At least one CH1 push edge was observed, every edge's
-    /// `last_src_addr` was inside the SHADOW range, and every pushed
-    /// byte matched the deterministic pattern `(addr & 0xFF) ^ 0x55`.
-    Pass { edges: usize },
+    /// `last_src_addr` was inside the SHADOW range, every pushed byte
+    /// matched the deterministic pattern `(addr & 0xFF) ^ 0x55`, and
+    /// the harness saw `last_src_addr` take more than one distinct
+    /// value (proving CH1.READ_ADDR is updating in response to the
+    /// address-pin sweep, not stuck on a firmware-initialised value).
+    Pass {
+        edges: usize,
+        distinct_src_addrs: usize,
+    },
     Fail(String),
 }
 
@@ -647,8 +734,9 @@ enum SmokeVerdict {
 /// captured during the observation window.
 ///
 /// `push_edges` rows: (relative cycle, last_src_addr, byte read back
-/// from `last_src_addr` at the cycle of the push). SHADOW is populated
-/// at sync time and never written again, so the byte read here is
+/// from `last_src_addr` at the cycle of the push, address-pin word
+/// being driven at the time of the push). SHADOW is populated at
+/// sync time and never written again, so the byte read here is
 /// exactly the byte CH1 fed to PIO2's TX FIFO.
 ///
 /// `ch1_pushes` is the total `push_count` delta over the window —
@@ -659,8 +747,19 @@ enum SmokeVerdict {
 ///   1. At least one push edge.
 ///   2. Every edge's `last_src_addr` ∈ [shadow_base, shadow_base + shadow_size).
 ///   3. Every pushed byte equals `((last_src_addr & 0xFF) ^ 0x55) as u8`.
+///   4. The set of distinct `last_src_addr` values across all push
+///      edges has cardinality > 1.
+///
+/// Criterion 4 is what specifically catches a stuck CH1.READ_ADDR
+/// (the rp2350-emu pre-0.2.3 `Bus::tick_dma` borrow trap, where every
+/// DMA-to-DMA write was swallowed by the `mem::take` stand-in). The
+/// address-pin sweep drives several distinct address words; if the
+/// CH0 → CH1.READ_ADDR pipe is alive, push edges land on multiple
+/// distinct SHADOW offsets. If the pipe is broken, every push lands
+/// on the same firmware-initialised offset and the cardinality
+/// collapses to 1.
 fn evaluate_smoke_test(
-    push_edges: &[(u64, u32, u8)],
+    push_edges: &[(u64, u32, u8, u16)],
     ch1_pushes: u32,
     shadow_base: u32,
     shadow_size: u32,
@@ -693,33 +792,60 @@ fn evaluate_smoke_test(
     }
 
     let shadow_end = shadow_base.wrapping_add(shadow_size);
-    for (cyc, src, byte) in push_edges {
+    for (cyc, src, byte, addr_word) in push_edges {
         if !(*src >= shadow_base && *src < shadow_end) {
             return SmokeVerdict::Fail(format!(
                 "CH1 push at rel cycle {} read from src=0x{:08X}, which \
                  is outside SHADOW range [0x{:08X}..0x{:08X}). \
+                 Address pins were 0x{:04X} at this cycle. \
                  Clue: CH1 is firing but reading from the wrong address \
                  — possible address-deposit-from-CH0 issue, wrong PIO \
                  program output, or stale `last_src_addr` from a prior \
                  transfer.",
-                cyc, src, shadow_base, shadow_end
+                cyc, src, shadow_base, shadow_end, addr_word
             ));
         }
         let expected = ((*src & 0xFF) ^ 0x55) as u8;
         if *byte != expected {
             return SmokeVerdict::Fail(format!(
                 "CH1 push at rel cycle {} from src=0x{:08X} returned \
-                 byte=0x{:02X}, expected=0x{:02X}. Clue: CH1 is reading \
-                 the right address but the byte came back wrong — \
-                 possible SHADOW corruption (something else is writing \
-                 to the populated range) or a wrong-byte-lane bug in \
-                 the DMA read path.",
-                cyc, src, byte, expected
+                 byte=0x{:02X}, expected=0x{:02X}. Address pins were \
+                 0x{:04X} at this cycle. Clue: CH1 is reading the right \
+                 address but the byte came back wrong — possible SHADOW \
+                 corruption (something else is writing to the populated \
+                 range) or a wrong-byte-lane bug in the DMA read path.",
+                cyc, src, byte, expected, addr_word
             ));
         }
     }
 
+    // Criterion 4: the address-pin sweep should have driven CH1's
+    // `READ_ADDR` register through multiple distinct values. Count
+    // distinct `last_src_addr` entries and require > 1.
+    let mut distinct: Vec<u32> = push_edges.iter().map(|(_, src, _, _)| *src).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() <= 1 {
+        let stuck_at = distinct.first().copied().unwrap_or(0);
+        return SmokeVerdict::Fail(format!(
+            "CH1 fired {} times during the address-pin sweep but \
+             `last_src_addr` only ever took {} distinct value(s) \
+             (stuck at 0x{:08X}). The sweep drove {} distinct address \
+             words on A0..A12, so CH1's READ_ADDR register should be \
+             tracking the stimulus. Almost certainly the CH0 → \
+             CH1.READ_ADDR DMA-to-DMA write is being dropped — exactly \
+             the rp2350-emu pre-0.2.3 `Bus::tick_dma` `mem::take` \
+             borrow trap. Check the regression test \
+             `dma::tests::dma_to_dma_write_during_tick_lands_on_live_dma`.",
+            push_edges.len(),
+            distinct.len(),
+            stuck_at,
+            ADDR_SWEEP.len(),
+        ));
+    }
+
     SmokeVerdict::Pass {
         edges: push_edges.len(),
+        distinct_src_addrs: distinct.len(),
     }
 }

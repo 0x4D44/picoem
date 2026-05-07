@@ -47,6 +47,14 @@ pub const NUM_CHANNELS: usize = 16;
 /// DMA base address (AHB-Lite, not APB).
 pub const DMA_BASE: u32 = 0x5000_0000;
 
+/// Size of the DMA register aperture as decoded by `Bus::read32`/`write32`
+/// (16 KB — one 4 KB page at 0x5000_0000 plus three APB alias mirrors at
+/// `+0x1000`/`+0x2000`/`+0x3000`). Used by [`Dma::issue_transfer`] to
+/// detect DMA-to-DMA transfers and route them through `self` instead of
+/// the bus, which would otherwise land on the empty stand-in left by
+/// [`crate::bus::Bus::tick_dma`]'s `mem::take`.
+const DMA_APERTURE_SIZE: u32 = 0x4000;
+
 // Per-channel register offsets inside one 0x40-byte channel stride.
 const CH_READ_ADDR: u32 = 0x00;
 const CH_WRITE_ADDR: u32 = 0x04;
@@ -792,17 +800,18 @@ impl Dma {
             )
         };
 
-        // Issue one transfer.
-        let value = match size {
-            1 => bus.read8(read_addr, 0) as u32,
-            2 => bus.read16(read_addr, 0) as u32,
-            _ => bus.read32(read_addr, 0),
-        };
-        match size {
-            1 => bus.write8(write_addr, value as u8, 0),
-            2 => bus.write16(write_addr, value as u16, 0),
-            _ => bus.write32(write_addr, value, 0),
-        }
+        // Issue one transfer. DMA-to-DMA transfers (read_addr or
+        // write_addr falling inside the DMA register aperture) must
+        // bypass `bus.read*` / `bus.write*` and route through `self`
+        // directly: `Bus::tick_dma` `mem::take`s `self.dma` for the
+        // duration of the tick, so the bus's `DMA_BASE` dispatch arm
+        // would land on the empty stand-in and the access would be
+        // silently dropped (read returns 0, write goes to /dev/null).
+        // Real silicon's AHB carries DMA self-accesses to the DMA
+        // peripheral the same as any other master would; this branch
+        // emulates that.
+        let value = self.dma_routed_read(read_addr, size, bus);
+        self.dma_routed_write(write_addr, value, size, bus);
 
         // Test-only push-event observable. Recorded inside
         // `issue_transfer` synchronously with the bus write that
@@ -853,6 +862,78 @@ impl Dma {
                     self.channels[chain_to].trans_count = reload;
                 }
                 self.trigger_channel(chain_to);
+            }
+        }
+    }
+
+    /// True iff `addr` falls in the DMA register aperture decoded by
+    /// `Bus::read32`/`write32`. See [`DMA_APERTURE_SIZE`] for the
+    /// rationale and exact bound.
+    #[inline]
+    fn is_dma_aperture(addr: u32) -> bool {
+        addr.wrapping_sub(DMA_BASE) < DMA_APERTURE_SIZE
+    }
+
+    /// Issue one DMA-master read of `size` bytes at `addr`. Falls back
+    /// to the bus for normal addresses; routes DMA-aperture reads
+    /// through `self` so a self-read observes the live DMA state, not
+    /// the empty stand-in left by `Bus::tick_dma`'s `mem::take`.
+    #[inline]
+    fn dma_routed_read(&self, addr: u32, size: u32, bus: &mut Bus) -> u32 {
+        if Self::is_dma_aperture(addr) {
+            // DMA registers are 32-bit; sub-word reads pick the bytes
+            // out of the underlying word the same way `Bus::read8/16`
+            // do for word-only peripherals (LE byte select).
+            let canonical = addr & !0x3000;
+            let word_offset = canonical & 0x0000_0FFC;
+            let word = self.read32(word_offset);
+            match size {
+                1 => (word >> ((addr & 3) * 8)) & 0xFF,
+                2 => (word >> ((addr & 2) * 8)) & 0xFFFF,
+                _ => word,
+            }
+        } else {
+            match size {
+                1 => bus.read8(addr, 0) as u32,
+                2 => bus.read16(addr, 0) as u32,
+                _ => bus.read32(addr, 0),
+            }
+        }
+    }
+
+    /// Issue one DMA-master write of `size` bytes (`value`) at `addr`.
+    /// Falls back to the bus for normal addresses; routes DMA-aperture
+    /// writes through `self` so the update lands on the live DMA, not
+    /// the empty stand-in. Preserves the bus-level cross-cutting
+    /// concerns (LR/SC reservation invalidation, MMIO trace) that
+    /// `Bus::write*` would have applied on the silicon path.
+    #[inline]
+    fn dma_routed_write(&mut self, addr: u32, value: u32, size: u32, bus: &mut Bus) {
+        if Self::is_dma_aperture(addr) {
+            // V1 DMA-to-DMA writes are word-only — every channel
+            // register is 32-bit and sub-word access on real silicon
+            // is unspecified for AHB-Lite slaves. If a corpus ever
+            // exercises narrow self-writes, expand here with the
+            // matching RMW path the peripheral bus uses.
+            debug_assert_eq!(
+                size, 4,
+                "DMA-to-DMA narrow transfer not modelled (size={size}, addr=0x{addr:08X})"
+            );
+            let canonical = addr & !0x3000;
+            let offset = canonical & 0x0000_0FFF;
+            let alias = (addr >> 12) & 3;
+            self.write32(offset, value, alias);
+            // Mirror the cross-cutting work `Bus::write32` would have
+            // done before reaching the DMA aperture dispatch.
+            bus.invalidate_reservation_at(addr);
+            if bus.mmio_trace_enabled {
+                bus.emit_mmio_trace('W', size, addr, value, 0);
+            }
+        } else {
+            match size {
+                1 => bus.write8(addr, value as u8, 0),
+                2 => bus.write16(addr, value as u16, 0),
+                _ => bus.write32(addr, value, 0),
             }
         }
     }
@@ -2362,6 +2443,96 @@ mod tests {
             intr & 0b11,
             0b11,
             "INTR bits 0 and 1 must both latch (both channels completed in one tick)"
+        );
+    }
+
+    /// Regression: a DMA-issued write whose destination is another
+    /// channel's `READ_ADDR` register (i.e. inside the DMA aperture)
+    /// must land on the live `Dma`, not on the empty stand-in left by
+    /// `Bus::tick_dma`'s `mem::take`.
+    ///
+    /// The OneROM SDRR firmware idiom is precisely this: CH0 reads an
+    /// address from a PIO RX FIFO and writes it to `CH1.READ_ADDR`,
+    /// then CH1 reads from the address CH0 just deposited and pushes
+    /// the byte to PIO2's TX FIFO. Pre-fix, the write to
+    /// `0x5000_0040` (CH1.READ_ADDR) dispatched through `Bus::write32`
+    /// → `self.dma.write32(...)` where `self.dma` was the empty
+    /// `Dma::default()` stand-in for the duration of `dma.tick(bus)`.
+    /// CH1.READ_ADDR therefore stayed at whatever the firmware
+    /// originally programmed; CH1 read from the wrong place; the bug
+    /// surfaced as a stuck `last_src_addr` in the OneROM full-system
+    /// smoke (which only checked "land somewhere in SHADOW", not
+    /// "track the address pin pattern").
+    #[test]
+    fn dma_to_dma_write_during_tick_lands_on_live_dma() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        // The address CH0 will deposit, and the byte sitting at that
+        // address. If CH1.READ_ADDR updates correctly, CH1 reads from
+        // here and the scratch cell holds `expected`.
+        let address_to_deposit: u32 = 0x2000_0DEA;
+        let expected: u32 = 0xCAFE_F00D;
+        bus.write32(address_to_deposit, expected, 0);
+
+        // Where CH1 will write the byte it reads.
+        let scratch: u32 = 0x2000_0700;
+        bus.write32(scratch, 0, 0);
+
+        // Push the address into PIO0 SM0 RX FIFO so CH0 (paced on
+        // DREQ_PIO0_RX0) has something to drain.
+        bus.pio[0].push_rx(0, address_to_deposit);
+
+        // CH0: read PIO0 RXF0, write CH1.READ_ADDR
+        // (DMA_BASE + 1*0x40 + 0x00 = 0x5000_0040). No incr; one
+        // transfer; paced on DREQ_PIO0_RX0 (TREQ=4).
+        let pio0_rxf0: u32 = 0x5020_0000 + 0x020;
+        let ch1_read_addr_reg: u32 = DMA_BASE + 1 * 0x40 + 0x00;
+        bus.write32(DMA_BASE + 0 * 0x40 + 0x00, pio0_rxf0, 0);
+        bus.write32(DMA_BASE + 0 * 0x40 + 0x04, ch1_read_addr_reg, 0);
+        bus.write32(DMA_BASE + 0 * 0x40 + 0x08, 1, 0);
+        let ctrl0 = make_ctrl(true, 2, false, false, 4, 0, 0, false);
+        bus.write32(DMA_BASE + 0 * 0x40 + 0x0C, ctrl0, 0);
+
+        // CH1: read from a placeholder address, write `scratch`. The
+        // placeholder is meaningfully different from
+        // `address_to_deposit` so the assertion can distinguish "CH1
+        // read from where CH0 deposited" from "CH1 read from its
+        // original placeholder". Paced on the same DREQ; one transfer.
+        let placeholder: u32 = 0x2000_0500;
+        bus.write32(placeholder, 0xBAAD_BAAD, 0);
+        bus.write32(DMA_BASE + 1 * 0x40 + 0x00, placeholder, 0);
+        bus.write32(DMA_BASE + 1 * 0x40 + 0x04, scratch, 0);
+        bus.write32(DMA_BASE + 1 * 0x40 + 0x08, 1, 0);
+        let ctrl1 = make_ctrl(true, 2, false, false, 4, 0, 0, false);
+        bus.write32(DMA_BASE + 1 * 0x40 + 0x0C, ctrl1, 0);
+
+        // One tick. CH0 fires first (lowest index), updates
+        // CH1.READ_ADDR; CH1 then fires using the just-written value.
+        bus.tick_dma();
+
+        // The smoking-gun assertion: CH1 must have read from the
+        // address CH0 deposited, not from its original placeholder.
+        assert_eq!(
+            bus.read32(scratch, 0),
+            expected,
+            "CH1 must read from the address CH0 deposited into CH1.READ_ADDR \
+             (got 0x{:08X}, expected 0x{:08X} at SRAM[0x{:08X}]). If this \
+             reads as 0xBAAD_BAAD, CH0's write to CH1.READ_ADDR was \
+             swallowed by the empty `Dma::default()` stand-in left by \
+             `Bus::tick_dma`'s `mem::take` — the very bug this test \
+             guards against.",
+            bus.read32(scratch, 0),
+            expected,
+            address_to_deposit,
+        );
+
+        // Cross-check the live CH1.READ_ADDR observable too: it should
+        // hold the deposited address (not the original placeholder).
+        let ch1_read_addr_observed = bus.read32(ch1_read_addr_reg, 0);
+        assert_eq!(
+            ch1_read_addr_observed, address_to_deposit,
+            "CH1.READ_ADDR must reflect the value CH0 wrote to it"
         );
     }
 
