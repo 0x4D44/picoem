@@ -14,6 +14,67 @@ public release simply ships those current versions.
 
 ## [Unreleased]
 
+## [2026-05-07] — third release
+
+Patch release for `rp2350-emu`. Three narrow-write fixes plus an
+observation-based smoke verdict in the OneROM full-system harness.
+
+RESETS narrow-write widening: `Bus::write8` / `Bus::write16` for
+`0x4002_0000` previously dropped byte/halfword writes (`=> {}` with the
+comment "RESETS: only word-aligned writes meaningful"). Real silicon's
+AHB widens narrow writes to 32-bit before the peripheral sees them.
+RESETS has a single writable register (`RESET` at offset `0x000`) and
+no side-effect-on-read, so the standard subword-alias RMW dispatch via
+`resets_read` / `resets_write` composes cleanly. `STRB` / `STRH` to
+any RESETS alias (plain / XOR / SET / CLR) now lands.
+
+PIO TXF-only narrow-write widening: this morning's earlier 0.2.4
+attempt routed every PIO narrow write through the standard
+subword-alias RMW used by UART/SPI/I2C. That pattern doesn't transfer
+to PIO — FDEBUG / IRQ are W1C with **live read state** (RMW splice
+zeros bits outside the targeted byte), `SMn_INSTR` write32 calls
+`force_execute` (RMW would re-execute prior opcodes ORed with the
+narrow value), CTRL byte 1 carries self-clearing `SM_RESTART` actions,
+`SHIFTCTRL` byte 3 carries `FJOIN_TX/RX` FIFO-flush bits, and RXF
+**pops the FIFO on read**. After review the design changed to
+TXF-only widen (offsets `0x010..=0x01C`) with explicit drop for every
+other PIO register — matches `rp2040-emu`'s design philosophy and
+sidesteps every side-effect hazard above. Non-TXF narrow writes are
+dropped (matching pre-0.2.4 behaviour for those registers); only TXF
+gets widened. The widen now uses zero-extension `(val as u32) <<
+(byte_idx * 8)` directly instead of the brief subword-alias RMW that
+0.2.4 carried on disk — RP2350 is AHB5 (byte-strobed, no
+replication), distinct from rp2040-emu's AHB-Lite byte-replication.
+Both produce identical observables for OneROM's `OUT PINS, 8`
+(bottom byte only).
+
+OneROM full-system smoke harness verdict tightened: criterion 5 was
+rewritten from a wrong-formula computation
+(`((SHADOW_BASE + addr_word) & 0xFF) ^ 0x55` — assumed pin-to-SHADOW
+lift is identity, which it isn't) to an observation-based criterion:
+collect the CH1 push-byte set during each dwell window, require at
+least one obs cycle in that dwell with `oe == 0xFF` and `data_byte ∈
+push_bytes`. Empty dwells are inconclusive (skipped). Post-loop guard
+tightened from `pin_matches == 0` to `pin_matches < 2` to mirror
+criterion 4's distinct-src-addrs cardinality requirement. Smoke
+verdict feeds the harness exit code; sync-without-serve now exits
+FAILURE.
+
+Regression coverage in `crates/rp2350-emu/src/pio_tests.rs`:
+`pio_narrow_writes_widen_to_32_bit` (extended to lanes 2/3 byte +
+halfword lane 1 across PIO0/1/2),
+`pio_narrow_writes_to_rxf_dont_pop_fifo`,
+`pio_narrow_writes_to_fdebug_dont_corrupt`,
+`pio_narrow_writes_to_ctrl_dont_trigger_sm_restart`,
+`pio_narrow_writes_to_sm_instr_dont_force_execute`,
+plus `tests::resets_narrow_writes_widen_to_32_bit`.
+
+### Crates published to crates.io
+
+| Crate | Version | Change |
+|---|---|---|
+| `rp2350-emu` | `0.2.5` | RESETS narrow-write widening (subword-alias RMW); PIO TXF-only narrow-write widening with zero-extension for AHB5 byte-strobe semantics (non-TXF PIO narrow writes still dropped — silicon-correct given W1C/force-execute/SM_RESTART/FJOIN/RXF-pop side effects). OneROM full-system smoke harness verdict criterion 5 rewritten observation-based; `pin_matches < 2` now fails. |
+
 ## [2026-05-07]
 
 Patch release for `rp2350-emu`. DMA-to-DMA correctness fix: `Bus::tick_dma`
