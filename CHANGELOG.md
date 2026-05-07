@@ -14,6 +14,34 @@ public release simply ships those current versions.
 
 ## [Unreleased]
 
+## [2026-05-07]
+
+Patch release for `rp2350-emu`. DMA-to-DMA correctness fix: `Bus::tick_dma`
+swaps the live `Dma` out of `Bus` for the duration of `dma.tick(bus)` to
+avoid a cross-borrow, but pre-fix any DMA-issued bus write whose
+destination fell in the DMA register aperture (`0x5000_0000..0x5000_3FFF`)
+dispatched through the bus to the empty `Dma::default()` stand-in and was
+silently dropped. Chains that update one channel's registers from another
+(e.g. `CH0.WRITE_ADDR = CH1.READ_ADDR` — the OneROM SDRR firmware idiom)
+appeared to fire and decremented `TRANS_COUNT` but never updated the
+target register. Real silicon's AHB carries DMA self-accesses to the DMA
+peripheral the same as any other master would; this release routes
+DMA-aperture transfers through the live `Dma` directly inside
+`Dma::issue_transfer` to match.
+
+Regression covered by the new `dma::tests::dma_to_dma_write_during_tick_lands_on_live_dma`
+unit test, plus a tightened `onerom_full_system_rp2350` smoke harness that
+sweeps the external address pins through several distinct values and
+requires `last_src_addr` to take more than one distinct value across CH1
+push edges (the pre-fix harness drove a single all-zero address, which
+made a stuck `CH1.READ_ADDR` indistinguishable from a working pipe).
+
+### Crates published to crates.io
+
+| Crate | Version | Change |
+|---|---|---|
+| `rp2350-emu` | `0.2.3` | Fix DMA-to-DMA write drop in `Bus::tick_dma` borrow trap. DMA-aperture self-accesses now route through the live `Dma` instead of the `mem::take` stand-in. Adds a regression unit test; tightens the OneROM full-system smoke harness with an address-pin sweep. |
+
 ## [2026-05-06]
 
 Patch release for `rp2350-emu`. DMA pacing within the step quantum: the DMA
