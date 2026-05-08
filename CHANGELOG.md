@@ -14,6 +14,37 @@ public release simply ships those current versions.
 
 ## [Unreleased]
 
+## [2026-05-07] — fourth release
+
+Catch-up patch release for the three crates that have accumulated
+unpublished changes since the second release on 2026-05-04. No public
+API changes; all three are patch bumps over what is currently on
+crates.io.
+
+`rp2040-emu` 0.1.3 → 0.1.4 carries the `#[cfg(test)] pub(crate) fn`
+accessors and threaded-bus integration tests added during the
+coverage-push series (commit `0ad7764`). Test artefacts only — no
+production-side change.
+
+`rp2040-emu-tui` 0.1.2 → 0.1.3 and `rp2350-emu-tui` 0.1.2 → 0.1.3
+ship the `tracing/release_max_level_info` feature scoping fix from
+commit `3d5be42`. The cap was previously declared on
+`[workspace.dependencies]`, which Cargo unifies across the dep graph —
+every external consumer of `picoem-common` / `rp2040-emu` /
+`rp2350-emu` inherited the cap and silently lost their own
+`debug!` / `trace!` in release builds. The fix moves the feature to
+the binary crates' own `[dependencies]` entries (where it belongs per
+the `tracing` maintainers' guidance) so library consumers control
+their own log level. No public API change in either TUI crate.
+
+### Crates published to crates.io
+
+| Crate | Version | Change |
+|---|---|---|
+| `rp2040-emu` | `0.1.4` | Internal test additions only (`#[cfg(test)] pub(crate) fn` accessors + threaded-bus integration tests). No public API change. |
+| `rp2040-emu-tui` | `0.1.3` | Scope `tracing/release_max_level_info` to the binary crate so external consumers no longer inherit the cap. No public API change. |
+| `rp2350-emu-tui` | `0.1.3` | Same `tracing` scoping fix as `rp2040-emu-tui` 0.1.3. No public API change. |
+
 ## [2026-05-07] — third release
 
 Patch release for `rp2350-emu`. Three narrow-write fixes plus an
