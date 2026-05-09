@@ -14,6 +14,35 @@ public release simply ships those current versions.
 
 ## [Unreleased]
 
+## [2026-05-09] — fifth release
+
+Catch-up patch republication of the three library crates that were
+published on 2026-05-05 *before* the `tracing/release_max_level_info`
+scoping fix in commit `3d5be42`. At publish time Cargo flattens
+`tracing = { workspace = true }` into the literal feature list from
+`[workspace.dependencies]`, so the manifests on crates.io baked in
+`features = ["release_max_level_info"]` even though the local source
+tree never carried it directly. External consumers (e.g. `mddosem`)
+pulling `picoem-common 0.2.0` from crates.io were inheriting the
+INFO-cap on every release build and silently losing their own
+`debug!`/`trace!` output. The fourth release on 2026-05-07
+republished the binary-side TUIs but skipped the libraries, leaving
+the poison live on crates.io.
+
+This fifth release republishes `picoem-common`, `picoem-devices`, and
+`picoem-debug` with no source changes — just patch bumps so the
+republished manifests pick up the now-clean workspace dep. After this
+ships, `cargo update -p picoem-common` in any downstream consumer
+will drop the cap from its release builds.
+
+### Crates published to crates.io
+
+| Crate | Version | Change |
+|---|---|---|
+| `picoem-common` | `0.2.1` | Strip the inherited `tracing/release_max_level_info` feature from the published manifest. No source or API change. |
+| `picoem-devices` | `0.1.3` | Same `tracing` scoping fix as `picoem-common` 0.2.1. No source or API change. |
+| `picoem-debug` | `0.1.2` | Same `tracing` scoping fix. No source or API change (still a stub crate). |
+
 ## [2026-05-07] — fourth release
 
 Catch-up patch release for the three crates that have accumulated
