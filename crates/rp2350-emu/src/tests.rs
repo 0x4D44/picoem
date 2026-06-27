@@ -34952,7 +34952,11 @@ mod stage9_residue {
     // -----------------------------------------------------------------
     // threaded/emulator.rs — RunError shape + multi-panic enumeration.
     // -----------------------------------------------------------------
-    #[cfg(feature = "threading")]
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     mod threaded_emulator_residue {
         use crate::threaded::{RunError, ThreadedEmulator, WorkerName};
         use crate::{Config, Emulator};
@@ -35422,4 +35426,3 @@ fn resets_narrow_writes_widen_to_32_bit() {
     bus.write16(0x4002_2002, 0xABCD, 0);
     assert_eq!(bus.read32(0x4002_0000, 0), 0xABCD_0000);
 }
-

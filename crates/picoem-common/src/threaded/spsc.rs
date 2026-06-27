@@ -9,7 +9,8 @@
 //!
 //! - Producer loads own `head` (Relaxed), peer's `tail` (Acquire); writes
 //!   buffer (Relaxed), Release-stores head.
-//! - Consumer mirrors with tail/head swapped.
+//! - Consumer loads own `tail` (Relaxed), peer's `head` (Acquire); reads
+//!   buffer (Relaxed), Release-stores tail.
 //! - `len()`: Relaxed both — approximate count for status register.
 //! - `clear()`: Relaxed — only called during coordinator phase or reset
 //!   (no concurrent access).
@@ -17,10 +18,9 @@
 //! Fullness check uses unsigned wrap-around arithmetic, correct for all
 //! u32 values because capacity is a power of 2 in [2, 2^31].
 //!
-//! ## Platform assumption
-//!
-//! x86-64 TSO. Relaxed atomics compile to plain `mov`; no fences needed
-//! for correctness on this target.
+//! The release/acquire edge on `head` publishes the producer's payload
+//! store before the consumer reads it, so the queue is valid on weakly
+//! ordered targets as well as x86 TSO.
 //!
 //! ## Cross-chip reuse
 //!

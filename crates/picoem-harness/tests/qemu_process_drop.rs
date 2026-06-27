@@ -111,9 +111,8 @@ fn process_is_alive(pid: u32) -> bool {
             if r == 0 {
                 return true;
             }
-            // SAFETY: errno is per-thread.
-            let err = *libc::__errno_location();
-            err != libc::ESRCH
+            let err = std::io::Error::last_os_error().raw_os_error();
+            err != Some(libc::ESRCH)
         }
     }
     #[cfg(not(any(windows, unix)))]

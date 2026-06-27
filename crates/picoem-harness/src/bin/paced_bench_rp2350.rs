@@ -895,6 +895,10 @@ fn run_once(cfg: &RunConfig) -> f64 {
     let sys_clk_hz = cfg.sys_clk_hz;
     let unpaced = cfg.unpaced;
     let threaded = cfg.threaded;
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     let timing = cfg.timing;
     let step_quantum = cfg.step_quantum;
     let workload = cfg.workload;
@@ -966,7 +970,13 @@ fn run_once(cfg: &RunConfig) -> f64 {
         pio_mode,
         runtime_mode,
     );
+    #[cfg(target_arch = "x86_64")]
     println!("TSC calibrated: {} MHz\n", pacer.tsc_freq_hz() / 1_000_000);
+    #[cfg(not(target_arch = "x86_64"))]
+    println!(
+        "Pacer timer:    Instant backend ({} MHz tick scale)\n",
+        pacer.tsc_freq_hz() / 1_000_000
+    );
     println!(
         "{:>6} {:>14} {:>10} {:>8} {:>10} {:>8}",
         "time", "emu_cycles", "emu_MHz", "util%", "headroom%", "behind"
@@ -1070,7 +1080,7 @@ fn run_once(cfg: &RunConfig) -> f64 {
         // x86_64 (invariant TSC runs at a fixed base close to the CPU nominal
         // clock). Under HIGH_PRIORITY_CLASS / TIME_CRITICAL this gives a
         // stable-enough signal for the HLD §12 budget gate.
-        let host_cycles_per_emu = pacer.tsc_freq_hz() as f64 * wall_secs / executed.max(1) as f64;
+        let host_ticks_per_emu = pacer.tsc_freq_hz() as f64 * wall_secs / executed.max(1) as f64;
         println!(
             "Executed cyc:   {} (c0={}, c1={})",
             executed, c0_delta, c1_delta
@@ -1095,26 +1105,34 @@ fn run_once(cfg: &RunConfig) -> f64 {
         // not a regression. Show the budget verdict only for the two
         // workloads the gate was calibrated for; emit the raw number
         // informationally for the rest.
-        let budget_gated = matches!(workload, Workload::Basic | Workload::FpuHeavy);
-        if budget_gated {
-            println!(
-                "Host/emu cycle: {:.2} (target: <33 per HLD §12)",
-                host_cycles_per_emu
-            );
-            if host_cycles_per_emu < 33.0 {
-                println!("Budget:         OK ({:.2} < 33)", host_cycles_per_emu);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let budget_gated = matches!(workload, Workload::Basic | Workload::FpuHeavy);
+            if budget_gated {
+                println!(
+                    "Host/emu cycle: {:.2} (target: <33 per HLD §12)",
+                    host_ticks_per_emu
+                );
+                if host_ticks_per_emu < 33.0 {
+                    println!("Budget:         OK ({:.2} < 33)", host_ticks_per_emu);
+                } else {
+                    println!(
+                        "Budget:         OVER ({:.2} >= 33) — investigate regression",
+                        host_ticks_per_emu
+                    );
+                }
             } else {
                 println!(
-                    "Budget:         OVER ({:.2} >= 33) — investigate regression",
-                    host_cycles_per_emu
+                    "Host/emu cycle: {:.2} (informational; HLD §12 budget only gates basic/fpu-heavy)",
+                    host_ticks_per_emu
                 );
             }
-        } else {
-            println!(
-                "Host/emu cycle: {:.2} (informational; HLD §12 budget only gates basic/fpu-heavy)",
-                host_cycles_per_emu
-            );
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        println!(
+            "Host ns/emu cyc:{:>7.2} (informational; HLD §12 x86 TSC budget not applicable)",
+            host_ticks_per_emu
+        );
         println!("Verdict:        UNPACED (profiling mode)");
 
         // Threaded-mode --timing table. Runtime must outlive the

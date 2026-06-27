@@ -1,7 +1,3 @@
-// Note: this module uses `rp2350_emu::Pacer`, which is gated on
-// `#[cfg(target_arch = "x86_64")]` upstream. The whole showcase app therefore
-// inherits that constraint (same as the existing `paced_bench` binary).
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;

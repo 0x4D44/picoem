@@ -10,7 +10,12 @@
 //! on the same workload with a far simpler shell, the gap is in
 //! `core.step` / bus path, not in pacing overhead.
 
-use rp2350_emu::{Config, DEFAULT_STEP_QUANTUM, Emulator, EmulatorBuilder, ExecutionModel};
+use rp2350_emu::{Config, Emulator, EmulatorBuilder};
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+use rp2350_emu::{DEFAULT_STEP_QUANTUM, ExecutionModel};
 use std::time::Instant;
 
 #[cfg(target_os = "windows")]

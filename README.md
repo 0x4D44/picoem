@@ -34,7 +34,7 @@ RISC-V cores on RP2350 are out of scope:
 | Exceptions / NVIC / fault delivery | Working | Working |
 | Memory | 32 KB ROM, 520 KB SRAM, XIP flash | 16 KB ROM, 264 KB SRAM (no onboard flash) |
 | PIO blocks | Working | Working |
-| Pacer (wall-clock real-time pacing) | Working (`x86_64` only) | Type available; step cadence not yet quantum-based (see `tech_debt.md`) |
+| Pacer (wall-clock real-time pacing) | Working | Working |
 | UART / SPI / I2C / DMA / timers | Stubs | Stubs |
 | GDB RSP debug server | Stub | Stub |
 | TrustZone (SAU / ACCESSCTRL) | Design seams only — v1 treats everything as Secure | N/A |
@@ -174,7 +174,7 @@ Per-session journals (investigations, performance work, review cycles) live unde
 - `qemu-system-arm` for `qemu_diff_m33` / `qemu_diff_m0plus` (any reasonably recent release; the M0+ oracle uses `cortex-m0` because QEMU 10.2 doesn't ship a `cortex-m0plus` model — see `tech_debt.md`)
 - A Pi Pico debug probe + RP2354 target board for the `probe_*_rp2350` harnesses (optional)
 
-The `pacer` module uses `x86_64`-only atomics; builds on other hosts will work as a library but won't get wall-clock pacing.
+The `pacer` module uses an `rdtsc` backend on `x86_64` and an `Instant` backend elsewhere, so serial emulator builds and TUIs support macOS, Linux, and Windows. The threaded worker runtime remains limited to `x86_64` Windows/Linux.
 
 ## License
 

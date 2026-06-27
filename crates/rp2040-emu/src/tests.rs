@@ -13845,7 +13845,13 @@ mod stage8_lib_residue {
 
 #[cfg(test)]
 mod stage9_residue {
-    use crate::{Config, Emulator, EmulatorBuilder};
+    use crate::{Config, Emulator};
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    use crate::EmulatorBuilder;
 
     // ============================================================
     // lib.rs §1

@@ -541,7 +541,7 @@ fn run_once(cfg: &RunConfig) -> f64 {
         Err(ConfigError::ThreadingUnavailable) => {
             eprintln!(
                 "error: ExecutionModel::Threaded unavailable in this build \
-                 (requires x86_64 Windows + `threading` feature)"
+                 (requires x86_64 Windows/Linux + `threading` feature)"
             );
             std::process::exit(1);
         }
@@ -576,7 +576,13 @@ fn run_once(cfg: &RunConfig) -> f64 {
         pio_mode,
         runtime_mode,
     );
+    #[cfg(target_arch = "x86_64")]
     println!("TSC calibrated: {} MHz\n", pacer.tsc_freq_hz() / 1_000_000);
+    #[cfg(not(target_arch = "x86_64"))]
+    println!(
+        "Pacer timer:    Instant backend ({} MHz tick scale)\n",
+        pacer.tsc_freq_hz() / 1_000_000
+    );
     println!(
         "{:>6} {:>14} {:>10} {:>8} {:>10} {:>8}",
         "time", "emu_cycles", "emu_MHz", "util%", "headroom%", "behind"
@@ -671,7 +677,7 @@ fn run_once(cfg: &RunConfig) -> f64 {
         let c1_delta = c1_end.saturating_sub(c1_start);
         let executed = c0_delta.max(c1_delta);
         let mhz = executed as f64 / wall_secs / 1_000_000.0;
-        let host_cycles_per_emu = pacer.tsc_freq_hz() as f64 * wall_secs / executed.max(1) as f64;
+        let host_ticks_per_emu = pacer.tsc_freq_hz() as f64 * wall_secs / executed.max(1) as f64;
         println!(
             "Executed cyc:   {} (c0={}, c1={})",
             executed, c0_delta, c1_delta
@@ -681,7 +687,10 @@ fn run_once(cfg: &RunConfig) -> f64 {
             "Avg MHz:        {:.1} (per-core peak, from executed cycles)",
             mhz
         );
-        println!("Host/emu cycle: {:.2}", host_cycles_per_emu);
+        #[cfg(target_arch = "x86_64")]
+        println!("Host/emu cycle: {:.2}", host_ticks_per_emu);
+        #[cfg(not(target_arch = "x86_64"))]
+        println!("Host ns/emu cyc:{:>7.2}", host_ticks_per_emu);
         println!("Verdict:        UNPACED (profiling mode)");
         return mhz;
     }

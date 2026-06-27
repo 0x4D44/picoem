@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(not(target_arch = "x86_64"))]
+use std::time::{Duration, Instant};
 
 /// Shared monitoring state. Atomic counters updated on the hot path,
 /// safe to read from any thread without locking.
@@ -89,7 +91,7 @@ impl Default for PacerStats {
 /// For monitoring/dashboard purposes this is fine — all values are monotonically
 /// increasing and converge quickly.
 ///
-/// Preemption caveat: `wall_ns` is derived from TSC at quantum boundaries, so any
+/// Preemption caveat: `wall_ns` is derived at quantum boundaries, so any
 /// OS preemption that lands *during* an in-budget quantum's emulation phase is
 /// folded into `emulation_ns` (we only timestamp at begin/end). `utilization()`
 /// is therefore an upper bound on actual emulation-work fraction — real
@@ -131,7 +133,7 @@ impl PacerSnapshot {
 }
 
 // ---------------------------------------------------------------------------
-// Pacer — real-time pacing via rdtsc spin-wait
+// Pacer — real-time pacing via rdtsc or Instant spin-wait
 // ---------------------------------------------------------------------------
 
 /// Non-serializing timestamp read. Lower overhead, used only inside
@@ -238,6 +240,18 @@ fn calibrate_overhead(nominal_quantum_tsc: u64, tsc_freq_hz: u64) -> u64 {
     min_overhead.min(max_overhead)
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn quantum_ns(sys_clk_hz: u32, quantum_cycles: u64) -> u64 {
+    (1_000_000_000u128 * quantum_cycles as u128 / sys_clk_hz as u128).max(1) as u64
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
 /// Real-time pacer that spin-waits to keep emulation at the target clock rate.
 ///
 /// Usage:
@@ -249,20 +263,32 @@ fn calibrate_overhead(nominal_quantum_tsc: u64, tsc_freq_hz: u64) -> u64 {
 ///     pacer.end_quantum();
 /// }
 /// ```
-#[cfg(target_arch = "x86_64")]
 pub struct Pacer {
     /// Shared monitoring stats.
     stats: Arc<PacerStats>,
     /// Emulated cycles per quantum. Default 150 (= 1 us at 150 MHz).
     quantum_cycles: u64,
     /// Host rdtsc ticks per quantum (derived from calibration).
+    #[cfg(target_arch = "x86_64")]
     quantum_tsc_ticks: u64,
     /// rdtsc value at start of current quantum.
+    #[cfg(target_arch = "x86_64")]
     quantum_start_tsc: u64,
     /// TSC at first begin_quantum call. Set once on the first call.
+    #[cfg(target_arch = "x86_64")]
     first_begin_tsc: Option<u64>,
     /// Calibrated TSC frequency in Hz.
+    #[cfg(target_arch = "x86_64")]
     tsc_freq_hz: u64,
+    /// Wall-clock duration per quantum on hosts without an exposed TSC.
+    #[cfg(not(target_arch = "x86_64"))]
+    quantum_ns: u64,
+    /// Instant at start of current quantum.
+    #[cfg(not(target_arch = "x86_64"))]
+    quantum_start: Option<Instant>,
+    /// Instant at first begin_quantum call. Set once on the first call.
+    #[cfg(not(target_arch = "x86_64"))]
+    first_begin: Option<Instant>,
     /// Emulator system clock in Hz (e.g. 150_000_000). Mutable via
     /// [`Pacer::update_sys_clk_hz`] so pacing follows firmware clock
     /// reconfiguration — see LLD V2 §4.7.
@@ -273,13 +299,14 @@ pub struct Pacer {
     /// [`Pacer::with_quantum`] via [`calibrate_overhead`] and stored so
     /// [`Pacer::update_sys_clk_hz`] can reuse it when the system clock
     /// changes without re-running the 50 ms calibration sweep.
+    #[cfg(target_arch = "x86_64")]
     overhead: u64,
 }
 
-#[cfg(target_arch = "x86_64")]
 impl Pacer {
     /// Create a new pacer for the given emulator clock frequency.
-    /// Calibrates TSC and measures per-quantum overhead (~60 ms one-time cost).
+    /// On x86_64 this calibrates TSC and measures per-quantum overhead
+    /// (~60 ms one-time cost). Other hosts use `Instant` directly.
     pub fn new(sys_clk_hz: u32) -> Self {
         Self::with_quantum(sys_clk_hz, 150)
     }
@@ -287,26 +314,42 @@ impl Pacer {
     /// Create a pacer with a custom quantum size.
     pub fn with_quantum(sys_clk_hz: u32, quantum_cycles: u64) -> Self {
         assert!(quantum_cycles > 0, "quantum_cycles must be non-zero");
-        let tsc_freq_hz = calibrate_tsc();
-        let nominal = (tsc_freq_hz as u128 * quantum_cycles as u128 / sys_clk_hz as u128) as u64;
-        assert!(
-            nominal >= 100,
-            "quantum too small for TSC resolution (nominal = {} ticks)",
-            nominal
-        );
-        let overhead = calibrate_overhead(nominal, tsc_freq_hz);
-        let quantum_tsc_ticks = nominal.saturating_sub(overhead);
-        assert!(quantum_tsc_ticks > 0, "quantum_tsc_ticks is zero");
+        assert!(sys_clk_hz > 0, "sys_clk_hz must be non-zero");
+        #[cfg(target_arch = "x86_64")]
+        {
+            let tsc_freq_hz = calibrate_tsc();
+            let nominal =
+                (tsc_freq_hz as u128 * quantum_cycles as u128 / sys_clk_hz as u128) as u64;
+            assert!(
+                nominal >= 100,
+                "quantum too small for TSC resolution (nominal = {} ticks)",
+                nominal
+            );
+            let overhead = calibrate_overhead(nominal, tsc_freq_hz);
+            let quantum_tsc_ticks = nominal.saturating_sub(overhead);
+            assert!(quantum_tsc_ticks > 0, "quantum_tsc_ticks is zero");
 
-        Self {
-            stats: Arc::new(PacerStats::new()),
-            quantum_cycles,
-            quantum_tsc_ticks,
-            quantum_start_tsc: 0,
-            first_begin_tsc: None,
-            tsc_freq_hz,
-            sys_clk_hz: sys_clk_hz as u64,
-            overhead,
+            Self {
+                stats: Arc::new(PacerStats::new()),
+                quantum_cycles,
+                quantum_tsc_ticks,
+                quantum_start_tsc: 0,
+                first_begin_tsc: None,
+                tsc_freq_hz,
+                sys_clk_hz: sys_clk_hz as u64,
+                overhead,
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Self {
+                stats: Arc::new(PacerStats::new()),
+                quantum_cycles,
+                quantum_ns: quantum_ns(sys_clk_hz, quantum_cycles),
+                quantum_start: None,
+                first_begin: None,
+                sys_clk_hz: sys_clk_hz as u64,
+            }
         }
     }
 
@@ -320,21 +363,31 @@ impl Pacer {
         self.quantum_cycles
     }
 
-    /// Calibrated TSC frequency.
+    /// Host timing frequency used by the pacer. On x86_64 this is the
+    /// calibrated TSC frequency; on other hosts the `Instant` backend is
+    /// reported as nanosecond ticks.
     pub fn tsc_freq_hz(&self) -> u64 {
-        self.tsc_freq_hz
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.tsc_freq_hz
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            1_000_000_000
+        }
     }
 
     /// Host rdtsc ticks per quantum after overhead compensation. Exposed
     /// `pub(crate)` for unit tests that exercise [`Self::update_sys_clk_hz`];
     /// not part of the public API.
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     pub(crate) fn quantum_tsc_ticks(&self) -> u64 {
         self.quantum_tsc_ticks
     }
 
     /// Update the effective emulator system clock and recompute
-    /// `quantum_tsc_ticks` so spin-wait targets track the new frequency.
+    /// `quantum_tsc_ticks` / `quantum_ns` so spin-wait targets track the
+    /// new frequency.
     ///
     /// Called by the sim thread after each quantum — see LLD V2 §4.7.
     /// Zero-cost when the frequency is unchanged (the fast path is a
@@ -355,28 +408,59 @@ impl Pacer {
             return;
         }
         self.sys_clk_hz = new;
-        let nominal = (self.tsc_freq_hz as u128 * self.quantum_cycles as u128 / new as u128) as u64;
-        // Mirror the `calibrate_overhead` clamp from `Pacer::with_quantum`:
-        // when the new quantum is small (high sys_clk) the stored overhead
-        // (calibrated against the old, larger quantum) can exceed `nominal`,
-        // saturating ticks to zero. Cap the overhead applied here at 25% of
-        // the new nominal so we always retain a non-zero quantum.
-        let effective_overhead = self.overhead.min(nominal / 4);
-        self.quantum_tsc_ticks = nominal.saturating_sub(effective_overhead).max(1);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let nominal =
+                (self.tsc_freq_hz as u128 * self.quantum_cycles as u128 / new as u128) as u64;
+            // Mirror the `calibrate_overhead` clamp from `Pacer::with_quantum`:
+            // when the new quantum is small (high sys_clk) the stored overhead
+            // (calibrated against the old, larger quantum) can exceed `nominal`,
+            // saturating ticks to zero. Cap the overhead applied here at 25% of
+            // the new nominal so we always retain a non-zero quantum.
+            let effective_overhead = self.overhead.min(nominal / 4);
+            self.quantum_tsc_ticks = nominal.saturating_sub(effective_overhead).max(1);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.quantum_ns =
+                (1_000_000_000u128 * self.quantum_cycles as u128 / new as u128).max(1) as u64;
+        }
     }
 
     /// Mark the start of a quantum. Call before stepping the emulator.
     #[inline(always)]
     pub fn begin_quantum(&mut self) {
-        let tsc = rdtscp();
-        self.first_begin_tsc.get_or_insert(tsc);
-        self.quantum_start_tsc = tsc;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let tsc = rdtscp();
+            self.first_begin_tsc.get_or_insert(tsc);
+            self.quantum_start_tsc = tsc;
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let now = Instant::now();
+            self.first_begin.get_or_insert(now);
+            self.quantum_start = Some(now);
+        }
     }
 
     /// End a quantum. Spin-waits if we're ahead of real-time, updates stats.
     /// Call after stepping the emulator for `quantum_cycles()` cycles.
     #[inline(always)]
     pub fn end_quantum(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.end_quantum_tsc();
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.end_quantum_instant();
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn end_quantum_tsc(&mut self) {
         debug_assert!(
             self.quantum_start_tsc != 0,
             "begin_quantum() must be called before end_quantum()"
@@ -421,7 +505,42 @@ impl Pacer {
         self.stats.add_emulated_cycles(self.quantum_cycles);
     }
 
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline(always)]
+    fn end_quantum_instant(&mut self) {
+        let start = self
+            .quantum_start
+            .expect("begin_quantum() must be called before end_quantum()");
+        let emu_end = Instant::now();
+        let emulation_ns = duration_ns(emu_end.duration_since(start));
+
+        let final_time = if emulation_ns < self.quantum_ns {
+            let target = start + Duration::from_nanos(self.quantum_ns);
+            let mut now = emu_end;
+            while now < target {
+                std::hint::spin_loop();
+                now = Instant::now();
+            }
+            self.stats.add_emulation_ns(emulation_ns);
+            self.stats
+                .add_spin_ns(duration_ns(now.duration_since(emu_end)));
+            now
+        } else {
+            self.stats.add_emulation_ns(emulation_ns);
+            self.stats.increment_behind();
+            emu_end
+        };
+
+        let first = self
+            .first_begin
+            .expect("begin_quantum() must be called before end_quantum()");
+        self.stats
+            .set_wall_ns(duration_ns(final_time.duration_since(first)));
+        self.stats.add_emulated_cycles(self.quantum_cycles);
+    }
+
     /// Convert TSC ticks to nanoseconds.
+    #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     fn tsc_to_ns(&self, tsc_ticks: u64) -> u64 {
         (tsc_ticks as u128 * 1_000_000_000 / self.tsc_freq_hz as u128) as u64
@@ -569,6 +688,38 @@ mod tests {
     fn test_pacer_with_quantum() {
         let pacer = Pacer::with_quantum(150_000_000, 300);
         assert_eq!(pacer.quantum_cycles(), 300);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "x86_64"))]
+    fn test_pacer_creation_instant_backend() {
+        let pacer = Pacer::with_quantum(150_000_000, 300);
+        assert_eq!(pacer.quantum_cycles(), 300);
+        assert_eq!(pacer.tsc_freq_hz(), 1_000_000_000);
+        assert_eq!(pacer.quantum_ns, 2_000);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "x86_64"))]
+    fn test_pacer_begin_end_quantum_instant_backend() {
+        let mut pacer = Pacer::new(150_000_000);
+        pacer.begin_quantum();
+        pacer.end_quantum();
+
+        let snap = pacer.stats().snapshot();
+        assert!(snap.wall_ns > 0, "wall_ns should be non-zero");
+        assert_eq!(snap.emulated_cycles, 150);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "x86_64"))]
+    fn test_update_sys_clk_hz_instant_backend() {
+        let mut pacer = Pacer::new(6_500_000);
+        let before = pacer.quantum_ns;
+        pacer.update_sys_clk_hz(0);
+        assert_eq!(pacer.quantum_ns, before);
+        pacer.update_sys_clk_hz(150_000_000);
+        assert!(pacer.quantum_ns < before);
     }
 
     #[test]

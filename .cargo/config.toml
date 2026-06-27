@@ -1,15 +1,15 @@
-# Enforce `+fma` on supported hosts so that `f32::mul_add` / `f64::mul_add`
+# Enforce `+fma` on x86 hosts so that `f32::mul_add` / `f64::mul_add`
 # emit a hardware fused op (single rounding). The FPU emulator and the
 # differential oracle both rely on `mul_add` being truly fused — without
 # `+fma` the compiler falls back to `a*b + c` (two roundings), which would
 # produce UFC/IXC classification mismatches on boundary operands.
 #
-# See `fp_fma` in `crates/mdrp2350/src/core/execute_fpu.rs` and `ref_fma`
-# in `crates/mdpicoem-harness/src/ieee754_ref.rs`.
+# See `fp_fma` in `crates/rp2350-emu/src/core/execute_fpu.rs` and `ref_fma`
+# in `crates/picoem-harness/src/ieee754_ref.rs`.
 #
 # Belt-and-braces: `ieee754_ref.rs` also has a `compile_error!` gated on
-# `target_feature = "fma"` so any host NOT listed here fails the build
-# LOUDLY rather than silently falling back to two-rounding mul_add.
+# `target_feature = "fma"` on x86 and allows AArch64, where fused
+# multiply-add is part of the base FP/SIMD ISA used by macOS.
 
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+fma"]
@@ -23,7 +23,5 @@ rustflags = ["-C", "target-feature=+fma"]
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "target-feature=+fma"]
 
-# Apple Silicon has NEON + FMA as part of the base ARMv8-A spec, so `fma`
-# is on by default — listed here for documentation / grep discoverability.
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "target-feature=+fma"]
+# Do not set `target-feature=+fma` for Apple Silicon: rustc rejects that
+# feature name on AArch64 even though the hardware instruction is present.

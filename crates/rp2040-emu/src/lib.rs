@@ -48,7 +48,8 @@ pub mod threaded;
 ///   differentials). Single-threaded, per-instruction interleave.
 ///   Always available.
 /// - `Threaded` — multi-thread runtime; opt-in throughput optimization
-///   on x86_64 Windows hosts with the `threading` cargo feature on.
+///   on x86_64 Windows or Linux hosts with the `threading` cargo
+///   feature on.
 ///   Not validated against QEMU/silicon oracles. Not yet wired into
 ///   [`Emulator::step`] — arrives with Stage 3b.4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -68,7 +69,7 @@ pub enum ConfigError {
     /// `ExecutionModel::Threaded` selected but the current build does
     /// not include a threaded runtime — either the `threading` cargo
     /// feature is off, or the host is not one of the supported
-    /// platforms (currently x86_64 Windows only).
+    /// platforms (currently x86_64 Windows or Linux only).
     ThreadingUnavailable,
 }
 
@@ -77,7 +78,7 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::ThreadingUnavailable => write!(
                 f,
-                "ExecutionModel::Threaded is unavailable (requires x86_64 Windows \
+                "ExecutionModel::Threaded is unavailable (requires x86_64 Windows/Linux \
                  with the `threading` cargo feature enabled)"
             ),
         }
@@ -174,7 +175,6 @@ pub use self::bus::Bus;
 pub use self::core::CortexM0Plus;
 pub use self::memory::{Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 
-#[cfg(target_arch = "x86_64")]
 pub use picoem_common::Pacer;
 pub use picoem_common::{Clock, PacerSnapshot, PacerStats};
 

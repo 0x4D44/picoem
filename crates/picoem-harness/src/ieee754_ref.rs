@@ -25,16 +25,21 @@
 
 // The reference oracle relies on `f64::mul_add` being a true single-rounding
 // fused op (for `ref_fma` and the division residual probe). Without the
-// `+fma` target feature the compiler falls back to a * b + c with two
-// roundings, which silently de-synchronises the oracle from the emulator
-// (which uses `f32::mul_add`) and masks boundary bugs. Fail the build
-// LOUDLY rather than enumerate every possible host target in .cargo/config.toml.
+// `+fma` target feature on x86 the compiler falls back to a * b + c
+// with two roundings, which silently de-synchronises the oracle from the
+// emulator (which uses `f32::mul_add`) and masks boundary bugs. AArch64
+// has fused multiply-add in the base FP/SIMD ISA used by macOS, but Rust
+// does not expose a `target_feature = "fma"` cfg there.
 //
 // Exclude `doctest` builds: rustdoc compiles doctests without the rustflags
 // declared in `.cargo/config.toml`, so the `+fma` check would spuriously
 // trigger. Doctests here do not execute FMA-sensitive code, and the real
 // `cargo test` path still enforces the feature via `--lib`/`--bin`.
-#[cfg(all(not(target_feature = "fma"), not(doctest)))]
+#[cfg(all(
+    not(target_feature = "fma"),
+    not(target_arch = "aarch64"),
+    not(doctest)
+))]
 compile_error!(
     "picoem-harness requires the +fma target feature. \
      Add 'rustflags = [\"-C\", \"target-feature=+fma\"]' to your \
